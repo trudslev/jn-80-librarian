@@ -1,0 +1,119 @@
+name: Build Release Executables
+
+on:
+  push:
+    tags:
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset_name: jn80-librarian-mac
+          - os: windows-latest
+            asset_name: jn80-librarian-win.exe
+          - os: ubuntu-latest
+            asset_name: jn80-librarian-linux
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install pyinstaller
+        run: pip install pyinstaller
+
+      - name: Install windows-curses (Windows only)
+        if: runner.os == 'Windows'
+        run: pip install windows-curses
+
+      - name: Build standalone executable
+        run: >
+          pyinstaller
+          --onefile
+          --name jn80-librarian
+          --hidden-import=mido.backends.rtmidi
+          --collect-submodules mido.backends
+          --collect-all rtmidi
+          main.py
+
+      - name: Remove legacy uncompressed Unix assets
+        if: runner.os == 'Linux'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = context.ref.replace("refs/tags/", "");
+            let release;
+
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            } catch (error) {
+              core.info(`No release found for tag ${tag}; skipping legacy cleanup.`);
+              return;
+            }
+
+            const legacyAssets = new Set(["jn80-librarian-mac", "jn80-librarian-linux"]);
+            for (const asset of release.data.assets) {
+              if (!legacyAssets.has(asset.name)) {
+                continue;
+              }
+
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: asset.id,
+              });
+              core.info(`Deleted legacy asset: ${asset.name}`);
+            }
+
+      - name: Prepare platform artifact filename
+        id: prepare_asset
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp dist/jn80-librarian.exe "dist/${{ matrix.asset_name }}"
+            {
+              echo "upload_files<<EOF"
+              echo "dist/${{ matrix.asset_name }}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            cp dist/jn80-librarian "dist/${{ matrix.asset_name }}"
+            chmod +x "dist/${{ matrix.asset_name }}"
+            tar -czf "dist/${{ matrix.asset_name }}.tar.gz" -C dist "${{ matrix.asset_name }}"
+            (
+              cd dist
+              zip -q "${{ matrix.asset_name }}.zip" "${{ matrix.asset_name }}"
+            )
+            {
+              echo "upload_files<<EOF"
+              echo "dist/${{ matrix.asset_name }}.zip"
+              echo "dist/${{ matrix.asset_name }}.tar.gz"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload executable to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.prepare_asset.outputs.upload_files }}
+          fail_on_unmatched_files: true
