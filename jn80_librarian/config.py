@@ -27,6 +27,8 @@ class AppConfig:
     last_midi_port: Optional[str] = None
     last_write: Optional[WritePosition] = None
     last_browsed_dir: Optional[str] = None
+    last_init_from: Optional[WritePosition] = None
+    last_init_to: Optional[WritePosition] = None
 
     def to_dict(self) -> dict:
         data = {
@@ -39,20 +41,39 @@ class AppConfig:
         else:
             data["last_write_bank"] = self.last_write.bank
             data["last_write_slot"] = self.last_write.slot
+
+        if self.last_init_from is None:
+            data["last_init_from_bank"] = None
+            data["last_init_from_slot"] = None
+        else:
+            data["last_init_from_bank"] = self.last_init_from.bank
+            data["last_init_from_slot"] = self.last_init_from.slot
+
+        if self.last_init_to is None:
+            data["last_init_to_bank"] = None
+            data["last_init_to_slot"] = None
+        else:
+            data["last_init_to_bank"] = self.last_init_to.bank
+            data["last_init_to_slot"] = self.last_init_to.slot
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
-        bank = data.get("last_write_bank")
-        slot = data.get("last_write_slot")
-        last_write = None
-        if bank is not None and slot is not None:
+        def _parse_position(bank_key: str, slot_key: str) -> Optional[WritePosition]:
+            bank = data.get(bank_key)
+            slot = data.get(slot_key)
+            if bank is None or slot is None:
+                return None
             try:
                 pos = WritePosition(str(bank).upper(), int(slot))
                 pos.validate()
-                last_write = pos
+                return pos
             except (ValueError, TypeError):
-                last_write = None
+                return None
+
+        last_write = _parse_position("last_write_bank", "last_write_slot")
+        last_init_from = _parse_position("last_init_from_bank", "last_init_from_slot")
+        last_init_to = _parse_position("last_init_to_bank", "last_init_to_slot")
 
         last_browsed_dir = data.get("last_browsed_dir")
         if last_browsed_dir is not None:
@@ -66,6 +87,8 @@ class AppConfig:
             last_midi_port=last_midi_port,
             last_write=last_write,
             last_browsed_dir=last_browsed_dir,
+            last_init_from=last_init_from,
+            last_init_to=last_init_to,
         )
 
 

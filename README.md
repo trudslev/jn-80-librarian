@@ -6,6 +6,7 @@ Terminal SysEx librarian for Behringer JN-80 using a full-screen curses TUI.
 
 - Full-screen file browser showing folders and `.syx` files only
 - Multi-select with `Ctrl-T`
+- INIT erase range with `F2` (bank/preset to bank/preset)
 - MIDI output port selection with `F9` or `M`
 - Send with `F5` (choose bank/slot) or `F6` (next position)
 - Receive/download SysEx from synth with `F7` or `R`
@@ -30,6 +31,7 @@ python3 -m venv .venv
 - `Arrow Up/Down`: Move cursor
 - `Enter`: Open directory
 - `Ctrl-T`: Toggle selection on highlighted `.syx` file and move cursor down
+- `F2`: INIT erase presets in an inclusive bank/slot range (with confirmation)
 - `F9` or `M`: Open MIDI output port menu
 - `F5`: Send highlighted/selected with bank+slot dialog
 - `F6`: Send highlighted/selected to next slot after last write
@@ -41,6 +43,7 @@ python3 -m venv .venv
 
 - `.syx` files on disk are never modified.
 - During send, the destination write address and DATA bank/slot are rewritten in memory from the selected target.
+- F2 INIT sends an empty/blank JN-80 preset payload to each destination in the selected inclusive range.
 - After each send, the app listens briefly for a SysEx reply and reports `ACK` or `No ACK`.
 - F5/F6 open a result dialog for clear send feedback; status is also mirrored in the bottom status bar.
 - F5 bank/slot entry is constrained to valid values only (bank `A-T`, slot `01-20`).
@@ -59,7 +62,16 @@ python3 -m venv .venv
 - If an unmapped key is pressed, status shows the key name and suggests pressing `?` for help.
 - Directory rows are prefixed with `/`, and selected files are shown in yellow.
 
+## License
+
+This project is licensed under the MIT License. See the `LICENSE` file for details.
+
 ## Changelog
+
+### 1.1.0 - 2026-05-30
+
+- Added `F2` INIT workflow to erase presets in an inclusive bank/slot range with a confirmation prompt before write.
+- Long paths in modal dialog content (port names, saved filenames) are now truncated from the left, keeping the filename tail visible.
 
 ### 1.0.0 - 2026-05-29
 

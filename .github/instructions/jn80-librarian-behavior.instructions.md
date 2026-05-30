@@ -44,6 +44,7 @@ Follow this workflow in order:
   - Bug fixes
   - Breaking changes (if any)
   - Dependencies added/updated
+  Pause for user to confirm changelog entry is clear and complete before proceeding.
 
 5. **Git Commit** - Stage all changes:
   ```

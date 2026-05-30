@@ -10,7 +10,7 @@ from .browser import BrowserEntry, list_entries
 from .config import AppConfig, load_config, save_config
 from .midi import list_output_ports, receive_sysex, send_sysex
 from .position import BANKS, WritePosition, increment_position
-from .sysex import load_syx_file, parse_sysex_message, patch_bank_slot_in_memory, to_mido_sysex_data
+from .sysex import HEADER_PREFIX, load_syx_file, parse_sysex_message, patch_bank_slot_in_memory, to_mido_sysex_data
 
 
 @dataclass
@@ -22,6 +22,8 @@ class AppState:
     status: str = "Ready"
     selected_port: Optional[str] = None
     last_written: Optional[WritePosition] = None
+    last_init_from: WritePosition = field(default_factory=lambda: WritePosition("A", 1))
+    last_init_to: WritePosition = field(default_factory=lambda: WritePosition("A", 1))
     selection_order: dict[Path, int] = field(default_factory=dict)
     select_counter: int = 0
 
@@ -56,6 +58,26 @@ def _current_entry(state: AppState) -> Optional[BrowserEntry]:
     return None
 
 
+def _format_header_title(cwd: Path, draw_width: int) -> str:
+    if draw_width <= 0:
+        return ""
+
+    prefix = " JN-80 Librarian | "
+    suffix = " "
+    cwd_text = str(cwd)
+    available = draw_width - len(prefix) - len(suffix)
+    if available <= 0:
+        return prefix.strip()
+
+    if len(cwd_text) > available:
+        if available <= 3:
+            cwd_text = cwd_text[-available:]
+        else:
+            cwd_text = "..." + cwd_text[-(available - 3):]
+
+    return f"{prefix}{cwd_text}{suffix}"
+
+
 def _draw(stdscr: curses.window, state: AppState) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -79,9 +101,10 @@ def _draw(stdscr: curses.window, state: AppState) -> None:
 
     stdscr.bkgd(" ", curses.color_pair(4))
 
-    title = f" JN-80 Librarian | {state.cwd} "
+    draw_width = max(1, width - 1)
+    title = _format_header_title(state.cwd, draw_width)
     stdscr.attron(curses.color_pair(3))
-    stdscr.addnstr(0, 0, title.ljust(width), width - 1)
+    stdscr.addnstr(0, 0, title.ljust(draw_width), draw_width)
     stdscr.attroff(curses.color_pair(3))
 
     if has_box:
@@ -125,6 +148,7 @@ def _draw(stdscr: curses.window, state: AppState) -> None:
 
     usable_width = max(1, width - 1)
     segments = [
+        ("F2", "Init"),
         ("F5", "Send"),
         ("F6", "Next"),
         ("F7", "Receive"),
@@ -291,7 +315,7 @@ def _prompt_bank_slot(stdscr: Optional[curses.window], initial: str) -> Optional
             win.attron(curses.A_BOLD)
             win.addnstr(1, 2, "Send from bank+slot", win_w - 4)
             win.attroff(curses.A_BOLD)
-            win.addnstr(2, 2, "Enter=Confirm  Esc=Cancel  Left/Right=Field  Up/Down=Adjust", win_w - 4)
+            win.addnstr(2, 2, "Enter=Confirm  Esc=Cancel  Tab/Shift-Tab=Field  Up/Down=Adjust", win_w - 4)
 
             tens, ones = _slot_digits()
             bank_attr = curses.A_REVERSE if field == 0 else curses.A_NORMAL
@@ -458,6 +482,295 @@ def _select_from_menu(stdscr: curses.window, title: str, options: list[str], cur
             return None
 
 
+def _prompt_yes_no(stdscr: Optional[curses.window], title: str, message: str) -> bool:
+    if stdscr is None:
+        return False
+
+    lines = [title, "", message, "", "Enter/Y=Yes  Esc/N=No"]
+    height, width = stdscr.getmaxyx()
+    win_h = min(height - 2, len(lines) + 4)
+    content_width = max(len(line) for line in lines)
+    win_w = min(width - 2, max(64, content_width + 4))
+    y = max(0, (height - win_h) // 2)
+    x = max(0, (width - win_w) // 2)
+    win = curses.newwin(win_h, win_w, y, x)
+    win.keypad(True)
+
+    while True:
+        win.erase()
+        win.box()
+        for idx, line in enumerate(lines, start=1):
+            if idx >= win_h - 1:
+                break
+            attr = curses.A_BOLD if idx == 1 else curses.A_NORMAL
+            win.attron(attr)
+            win.addnstr(idx, 2, line, win_w - 4)
+            win.attroff(attr)
+        win.refresh()
+
+        ch = win.getch()
+        if ch in (10, 13, ord("y"), ord("Y")):
+            return True
+        if ch in (27, ord("n"), ord("N")):
+            return False
+
+
+def _truncate_line(line: str, max_width: int) -> str:
+    """Shorten a line to max_width, preserving the tail for path-like content."""
+    if max_width <= 0:
+        return ""
+    if len(line) <= max_width:
+        return line
+    # If the line has a path separator, keep the tail so the filename stays visible.
+    if "/" in line or "\\" in line:
+        colon_pos = line.find(": ")
+        if colon_pos != -1:
+            prefix = line[: colon_pos + 2]  # e.g. "Saved as: "
+            rest = line[colon_pos + 2 :]
+            rest_budget = max_width - len(prefix)
+            if rest_budget > 3:
+                return prefix + "..." + rest[-(rest_budget - 3) :]
+            return (prefix + rest)[: max_width]
+        return "..." + line[-(max_width - 3) :]
+    return line[: max_width]
+
+
+def _position_label(position: WritePosition) -> str:
+    return f"{position.bank}{position.slot:02d}"
+
+
+def _position_ordinal(position: WritePosition) -> int:
+    return (position.bank_index * 20) + position.slot_index
+
+
+def _positions_inclusive(start: WritePosition, end: WritePosition) -> list[WritePosition]:
+    start_ordinal = _position_ordinal(start)
+    end_ordinal = _position_ordinal(end)
+    if end_ordinal < start_ordinal:
+        return []
+
+    positions: list[WritePosition] = []
+    for absolute in range(start_ordinal, end_ordinal + 1):
+        bank_index = absolute // 20
+        slot_index = absolute % 20
+        positions.append(WritePosition(BANKS[bank_index], slot_index + 1))
+    return positions
+
+
+def _prompt_init_range(
+    stdscr: Optional[curses.window],
+    from_initial: str,
+    to_initial: str,
+) -> Optional[tuple[WritePosition, WritePosition]]:
+    if stdscr is None:
+        try:
+            return _parse_bank_slot(from_initial), _parse_bank_slot(to_initial)
+        except ValueError:
+            return WritePosition("A", 1), WritePosition("A", 1)
+
+    try:
+        from_pos = _parse_bank_slot(from_initial)
+    except ValueError:
+        from_pos = WritePosition("A", 1)
+    try:
+        to_pos = _parse_bank_slot(to_initial)
+    except ValueError:
+        to_pos = from_pos
+
+    height, width = stdscr.getmaxyx()
+    win_h = 10
+    win_w = min(72, max(54, width - 4))
+    y = (height - win_h) // 2
+    x = (width - win_w) // 2
+    win = curses.newwin(win_h, win_w, y, x)
+    win.keypad(True)
+
+    from_bank = from_pos.bank
+    from_slot = f"{from_pos.slot:02d}"
+    to_bank = to_pos.bank
+    to_slot = f"{to_pos.slot:02d}"
+    last_from_digit_field = getattr(_prompt_init_range, "_last_from_digit_field", 1)
+    if last_from_digit_field not in (1, 2):
+        last_from_digit_field = 1
+    last_to_digit_field = getattr(_prompt_init_range, "_last_to_digit_field", 4)
+    if last_to_digit_field not in (4, 5):
+        last_to_digit_field = 4
+    # Always start with the first bank field selected when opening.
+    field = 0
+
+    prev_cursor_state: Optional[int] = None
+    try:
+        prev_cursor_state = curses.curs_set(1)
+    except curses.error:
+        prev_cursor_state = None
+
+    def _render_slot(value: str, active_tens: bool, active_ones: bool, row: int, col: int) -> None:
+        win.addnstr(row, col - 6, "Slot:", 5)
+        win.attron(curses.A_REVERSE if active_tens else curses.A_NORMAL)
+        win.addnstr(row, col, value[0], 1)
+        win.attroff(curses.A_REVERSE if active_tens else curses.A_NORMAL)
+        win.attron(curses.A_REVERSE if active_ones else curses.A_NORMAL)
+        win.addnstr(row, col + 1, value[1], 1)
+        win.attroff(curses.A_REVERSE if active_ones else curses.A_NORMAL)
+
+    def _move_cursor() -> None:
+        col_map = {0: 14, 1: 24, 2: 25, 3: 14, 4: 24, 5: 25}
+        row = 4 if field < 3 else 6
+        win.move(row, col_map[field])
+
+    def _adjust_slot(slot_text: str, delta: int) -> str:
+        slot_value = int(slot_text)
+        slot_value += delta
+        if slot_value > 20:
+            slot_value = 1
+        if slot_value < 1:
+            slot_value = 20
+        return f"{slot_value:02d}"
+
+    try:
+        while True:
+            win.erase()
+            win.box()
+            win.attron(curses.A_BOLD)
+            win.addnstr(1, 2, "INIT range", win_w - 4)
+            win.attroff(curses.A_BOLD)
+            win.addnstr(2, 2, "Enter=Confirm  Esc=Cancel  Tab/Shift-Tab=Field  Up/Down=Adjust", win_w - 4)
+
+            win.addnstr(4, 2, "From Bank:", win_w - 4)
+            win.attron(curses.A_REVERSE if field == 0 else curses.A_NORMAL)
+            win.addnstr(4, 14, from_bank, 1)
+            win.attroff(curses.A_REVERSE if field == 0 else curses.A_NORMAL)
+            _render_slot(from_slot, field == 1, field == 2, 4, 24)
+
+            win.addnstr(6, 2, "To   Bank:", win_w - 4)
+            win.attron(curses.A_REVERSE if field == 3 else curses.A_NORMAL)
+            win.addnstr(6, 14, to_bank, 1)
+            win.attroff(curses.A_REVERSE if field == 3 else curses.A_NORMAL)
+            _render_slot(to_slot, field == 4, field == 5, 6, 24)
+
+            win.addnstr(7, 2, "Valid: bank A-T, slot 01-20", win_w - 4)
+            _move_cursor()
+            win.refresh()
+
+            ch = win.getch()
+            if ch in (10, 13):
+                _prompt_init_range._last_from_digit_field = last_from_digit_field
+                _prompt_init_range._last_to_digit_field = last_to_digit_field
+                from_value = WritePosition(from_bank, int(from_slot))
+                to_value = WritePosition(to_bank, int(to_slot))
+                return from_value, to_value
+            if ch == 27:
+                _prompt_init_range._last_from_digit_field = last_from_digit_field
+                _prompt_init_range._last_to_digit_field = last_to_digit_field
+                return None
+            if ch == curses.KEY_LEFT:
+                field = max(0, field - 1)
+                if field in (1, 2):
+                    last_from_digit_field = field
+                elif field in (4, 5):
+                    last_to_digit_field = field
+                continue
+            if ch == curses.KEY_RIGHT:
+                field = min(5, field + 1)
+                if field in (1, 2):
+                    last_from_digit_field = field
+                elif field in (4, 5):
+                    last_to_digit_field = field
+                continue
+            if ch == 9:
+                if field == 0:
+                    field = last_from_digit_field
+                elif field in (1, 2):
+                    field = 3
+                elif field == 3:
+                    field = last_to_digit_field
+                else:
+                    field = 0
+                continue
+            if ch == curses.KEY_BTAB:
+                if field == 0:
+                    field = last_to_digit_field
+                elif field in (1, 2):
+                    field = 0
+                elif field == 3:
+                    field = last_from_digit_field
+                else:
+                    field = 3
+                continue
+            if ch == curses.KEY_UP:
+                if field == 0:
+                    idx = BANKS.index(from_bank)
+                    from_bank = BANKS[(idx + 1) % len(BANKS)]
+                elif field in (1, 2):
+                    from_slot = _adjust_slot(from_slot, 1)
+                elif field == 3:
+                    idx = BANKS.index(to_bank)
+                    to_bank = BANKS[(idx + 1) % len(BANKS)]
+                else:
+                    to_slot = _adjust_slot(to_slot, 1)
+                continue
+            if ch == curses.KEY_DOWN:
+                if field == 0:
+                    idx = BANKS.index(from_bank)
+                    from_bank = BANKS[(idx - 1) % len(BANKS)]
+                elif field in (1, 2):
+                    from_slot = _adjust_slot(from_slot, -1)
+                elif field == 3:
+                    idx = BANKS.index(to_bank)
+                    to_bank = BANKS[(idx - 1) % len(BANKS)]
+                else:
+                    to_slot = _adjust_slot(to_slot, -1)
+                continue
+
+            if not (32 <= ch <= 126):
+                continue
+
+            char = chr(ch).upper()
+            if field in (0, 3):
+                if char in BANKS:
+                    if field == 0:
+                        from_bank = char
+                        field = last_from_digit_field
+                    else:
+                        to_bank = char
+                        field = last_to_digit_field
+                continue
+
+            if not char.isdigit():
+                continue
+
+            if field in (1, 2):
+                tens = from_slot[0]
+                if field == 1:
+                    new_tens = int(char)
+                    if new_tens > 2:
+                        continue
+                    from_slot = f"{new_tens}{from_slot[1]}"
+                    field = 2
+                    last_from_digit_field = field
+                else:
+                    from_slot = f"{tens}{char}"
+                    last_from_digit_field = field
+                continue
+
+            tens = to_slot[0]
+            if field == 4:
+                new_tens = int(char)
+                if new_tens > 2:
+                    continue
+                to_slot = f"{new_tens}{to_slot[1]}"
+                field = 5
+                last_to_digit_field = field
+            else:
+                to_slot = f"{tens}{char}"
+                last_to_digit_field = field
+    finally:
+        try:
+            curses.curs_set(0 if prev_cursor_state is None else prev_cursor_state)
+        except curses.error:
+            pass
+
+
 def _show_help_modal(stdscr: curses.window) -> None:
     lines = [
         "JN-80 Librarian Keys",
@@ -465,6 +778,7 @@ def _show_help_modal(stdscr: curses.window) -> None:
         "Up/Down      Move cursor",
         "Enter        Open directory",
         "Ctrl-T       Toggle selection + move down",
+        "F2           INIT (erase) range",
         "F9 or M      Select MIDI output port",
         "F5           Send with bank/slot prompt",
         "F6           Send to next position",
@@ -515,6 +829,7 @@ def _show_message_modal(stdscr: Optional[curses.window], title: str, message: st
     win = curses.newwin(win_h, win_w, y, x)
     win.keypad(True)
 
+    inner_w = win_w - 4
     win.erase()
     win.box()
     for idx, line in enumerate(lines, start=1):
@@ -522,7 +837,7 @@ def _show_message_modal(stdscr: Optional[curses.window], title: str, message: st
             break
         attr = curses.A_BOLD if idx == 1 else curses.A_NORMAL
         win.attron(attr)
-        win.addnstr(idx, 2, line, win_w - 4)
+        win.addnstr(idx, 2, _truncate_line(line, inner_w), inner_w)
         win.attroff(attr)
     win.refresh()
     win.getch()
@@ -624,6 +939,60 @@ def _send_files(state: AppState, start_position: WritePosition) -> tuple[bool, s
     return False, "Send failed", None
 
 
+def _send_init_range(
+    state: AppState,
+    start_position: WritePosition,
+    end_position: WritePosition,
+) -> tuple[bool, str, Optional[WritePosition]]:
+    positions = _positions_inclusive(start_position, end_position)
+    if not positions:
+        return False, "Invalid range: FROM must be before or equal to TO", None
+
+    # Empty JN-80 patch payload with blank data (including unnamed patch text).
+    empty_message = HEADER_PREFIX + bytes([0x00, 0x00]) + bytes([0x00] * 103) + bytes([0xF7])
+    parsed_empty = parse_sysex_message(empty_message)
+
+    last_success: Optional[WritePosition] = None
+    ack_count = 0
+    last_ack_message: Optional[str] = None
+
+    for position in positions:
+        patched = patch_bank_slot_in_memory(parsed_empty, position)
+        sysex_payload = to_mido_sysex_data(patched)
+
+        result = send_sysex(state.selected_port, sysex_payload)
+        if not result.ok:
+            if last_success is not None:
+                return (
+                    False,
+                    f"Erase stopped at {_position_label(position)}: {result.message}",
+                    last_success,
+                )
+            return False, result.message, None
+
+        if result.ack_received:
+            ack_count += 1
+            last_ack_message = result.ack_message
+        last_success = position
+
+    if len(positions) == 1 and last_success is not None:
+        base = f"Erased preset {_position_label(last_success)}"
+        if ack_count:
+            return True, f"{base} | ACK received", last_success
+        return True, f"{base} | No ACK", last_success
+
+    if last_success is not None:
+        base = f"Erased {len(positions)} presets, last {_position_label(last_success)}"
+        if ack_count:
+            ack_suffix = f" | ACK {ack_count}/{len(positions)}"
+            if ack_count == len(positions) and last_ack_message and "JN-80 reply" in last_ack_message:
+                ack_suffix += " (JN-80 confirmed)"
+            return True, f"{base}{ack_suffix}", last_success
+        return True, f"{base} | No ACK", last_success
+
+    return False, "Erase failed", None
+
+
 def _toggle_selection(state: AppState) -> None:
     entry = _current_entry(state)
     if not entry or entry.is_dir:
@@ -718,6 +1087,41 @@ def _handle_f6(stdscr: Optional[curses.window], state: AppState) -> None:
     _show_message_modal(stdscr, "Send Result" if ok else "Send Error", message)
 
 
+def _handle_f2(stdscr: Optional[curses.window], state: AppState) -> None:
+    selected = _prompt_init_range(
+        stdscr,
+        f"{state.last_init_from.bank}{state.last_init_from.slot}",
+        f"{state.last_init_to.bank}{state.last_init_to.slot}",
+    )
+    if selected is None:
+        state.status = "INIT canceled"
+        return
+
+    from_position, to_position = selected
+    state.last_init_from = from_position
+    state.last_init_to = to_position
+    if _position_ordinal(to_position) < _position_ordinal(from_position):
+        message = "Invalid range: FROM must be before or equal to TO"
+        state.status = message
+        _show_message_modal(stdscr, "INIT Error", message)
+        return
+
+    prompt = (
+        "Are you sure you want to erase presets "
+        f"from {_position_label(from_position)} to {_position_label(to_position)}?"
+    )
+    if not _prompt_yes_no(stdscr, "Confirm INIT", prompt):
+        state.status = "INIT canceled"
+        return
+
+    ok, message, last = _send_init_range(state, from_position, to_position)
+    state.status = message
+    if ok and last is not None:
+        state.last_written = last
+
+    _show_message_modal(stdscr, "INIT Result" if ok else "INIT Error", message)
+
+
 def _handle_receive(stdscr: Optional[curses.window], state: AppState) -> None:
     modal: Optional[curses.window] = None
     modal_w = 0
@@ -726,16 +1130,18 @@ def _handle_receive(stdscr: Optional[curses.window], state: AppState) -> None:
     def _render_modal(title: str, lines: list[str], footer: str = "") -> None:
         if modal is None:
             return
+        inner_w = modal_w - 4
         modal.erase()
         modal.box()
         modal.attron(curses.A_BOLD)
-        modal.addnstr(1, 2, title, modal_w - 4)
+        modal.addnstr(1, 2, _truncate_line(title, inner_w), inner_w)
         modal.attroff(curses.A_BOLD)
         max_rows = modal_h - 4
         for idx, line in enumerate(lines[:max_rows], start=2):
-            modal.addnstr(idx, 2, line.ljust(modal_w - 4), modal_w - 4)
+            truncated = _truncate_line(line, inner_w)
+            modal.addnstr(idx, 2, truncated.ljust(inner_w), inner_w)
         if footer:
-            modal.addnstr(modal_h - 2, 2, footer, modal_w - 4)
+            modal.addnstr(modal_h - 2, 2, _truncate_line(footer, inner_w), inner_w)
         modal.refresh()
 
     def _wait_any_key() -> None:
@@ -930,6 +1336,8 @@ def _persist(state: AppState) -> None:
             last_midi_port=state.selected_port,
             last_write=state.last_written,
             last_browsed_dir=str(state.cwd),
+            last_init_from=state.last_init_from,
+            last_init_to=state.last_init_to,
         )
     )
 
@@ -974,7 +1382,12 @@ def _app_loop(stdscr: curses.window, state: AppState) -> None:
                 state.cursor = min(len(state.entries) - 1, state.cursor + 1)
             continue
         if ch == curses.KEY_RESIZE:
-            # Resize events are expected; loop redraw will adapt layout.
+            # Force a clean repaint on resize so all panes reflow immediately.
+            try:
+                curses.update_lines_cols()
+            except curses.error:
+                pass
+            stdscr.clear()
             continue
         if ch in (10, 13):
             _open_entry(state)
@@ -985,6 +1398,10 @@ def _app_loop(stdscr: curses.window, state: AppState) -> None:
             continue
         if ch in (curses.KEY_F9, ord("m"), ord("M")):
             _choose_midi_port(stdscr, state)
+            _persist(state)
+            continue
+        if ch == curses.KEY_F2:
+            _handle_f2(stdscr, state)
             _persist(state)
             continue
         if ch == curses.KEY_F5:
@@ -1016,5 +1433,7 @@ def run() -> None:
         cwd=_safe_cwd(cfg),
         selected_port=cfg.last_midi_port,
         last_written=cfg.last_write,
+        last_init_from=cfg.last_init_from or WritePosition("A", 1),
+        last_init_to=cfg.last_init_to or WritePosition("A", 1),
     )
     curses.wrapper(_app_loop, state)

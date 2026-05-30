@@ -15,6 +15,8 @@ class TestConfig(unittest.TestCase):
                 last_midi_port="JN80",
                 last_write=WritePosition("C", 7),
                 last_browsed_dir="/tmp/patches",
+                last_init_from=WritePosition("D", 2),
+                last_init_to=WritePosition("E", 9),
             )
 
             with patch("jn80_librarian.config.config_path", return_value=cfg_path):
@@ -24,6 +26,8 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(loaded.last_midi_port, "JN80")
             self.assertEqual(loaded.last_write, WritePosition("C", 7))
             self.assertEqual(loaded.last_browsed_dir, "/tmp/patches")
+            self.assertEqual(loaded.last_init_from, WritePosition("D", 2))
+            self.assertEqual(loaded.last_init_to, WritePosition("E", 9))
 
     def test_load_invalid_json_falls_back_to_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,6 +40,8 @@ class TestConfig(unittest.TestCase):
             self.assertIsNone(loaded.last_midi_port)
             self.assertIsNone(loaded.last_write)
             self.assertIsNone(loaded.last_browsed_dir)
+            self.assertIsNone(loaded.last_init_from)
+            self.assertIsNone(loaded.last_init_to)
 
     def test_invalid_stored_write_position_is_ignored(self) -> None:
         data = {

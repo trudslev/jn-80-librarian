@@ -3,7 +3,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from jn80_librarian.app import AppState, _handle_f5, _handle_f6, _handle_receive, _send_files
+from jn80_librarian.app import (
+    AppState,
+    _handle_f2,
+    _handle_f5,
+    _handle_f6,
+    _handle_receive,
+    _positions_inclusive,
+    _send_files,
+)
 from jn80_librarian.midi import MidiReceiveResult, MidiResult
 from jn80_librarian.position import WritePosition
 from jn80_librarian.sysex import HEADER_PREFIX
@@ -16,6 +24,22 @@ def make_message() -> bytes:
 
 
 class TestAppSendFlow(unittest.TestCase):
+    def test_positions_inclusive_builds_cross_bank_range(self) -> None:
+        positions = _positions_inclusive(WritePosition("A", 19), WritePosition("B", 2))
+        self.assertEqual(
+            positions,
+            [
+                WritePosition("A", 19),
+                WritePosition("A", 20),
+                WritePosition("B", 1),
+                WritePosition("B", 2),
+            ],
+        )
+
+    def test_positions_inclusive_returns_empty_for_reversed_range(self) -> None:
+        positions = _positions_inclusive(WritePosition("C", 3), WritePosition("B", 20))
+        self.assertEqual(positions, [])
+
     def test_send_files_uses_selection_timestamp_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -68,6 +92,72 @@ class TestAppSendFlow(unittest.TestCase):
 
         self.assertEqual(state.last_written, WritePosition("A", 1))
         self.assertEqual(state.selection_order, {file_path: 1})
+
+    def test_handle_f2_sets_last_written_on_success(self) -> None:
+        state = AppState(cwd=Path.cwd(), selected_port="JN80")
+
+        with patch(
+            "jn80_librarian.app._prompt_init_range",
+            return_value=(WritePosition("A", 1), WritePosition("A", 3)),
+        ):
+            with patch("jn80_librarian.app._prompt_yes_no", return_value=True):
+                with patch(
+                    "jn80_librarian.app._send_init_range",
+                    return_value=(True, "Erased", WritePosition("A", 3)),
+                ) as mock_send:
+                    _handle_f2(None, state)
+
+        self.assertEqual(state.status, "Erased")
+        self.assertEqual(state.last_written, WritePosition("A", 3))
+        self.assertEqual(state.last_init_from, WritePosition("A", 1))
+        self.assertEqual(state.last_init_to, WritePosition("A", 3))
+        mock_send.assert_called_once()
+
+    def test_handle_f2_prefills_with_persisted_values(self) -> None:
+        state = AppState(
+            cwd=Path.cwd(),
+            selected_port="JN80",
+            last_init_from=WritePosition("C", 4),
+            last_init_to=WritePosition("D", 5),
+        )
+
+        with patch(
+            "jn80_librarian.app._prompt_init_range",
+            return_value=(WritePosition("C", 4), WritePosition("D", 5)),
+        ) as mock_prompt:
+            with patch("jn80_librarian.app._prompt_yes_no", return_value=False):
+                _handle_f2(None, state)
+
+        args = mock_prompt.call_args.args
+        self.assertEqual(args[1], "C4")
+        self.assertEqual(args[2], "D5")
+
+    def test_handle_f2_cancels_when_not_confirmed(self) -> None:
+        state = AppState(cwd=Path.cwd(), selected_port="JN80")
+
+        with patch(
+            "jn80_librarian.app._prompt_init_range",
+            return_value=(WritePosition("A", 1), WritePosition("A", 2)),
+        ):
+            with patch("jn80_librarian.app._prompt_yes_no", return_value=False):
+                with patch("jn80_librarian.app._send_init_range") as mock_send:
+                    _handle_f2(None, state)
+
+        self.assertEqual(state.status, "INIT canceled")
+        mock_send.assert_not_called()
+
+    def test_handle_f2_rejects_reversed_range(self) -> None:
+        state = AppState(cwd=Path.cwd(), selected_port="JN80")
+
+        with patch(
+            "jn80_librarian.app._prompt_init_range",
+            return_value=(WritePosition("B", 3), WritePosition("A", 2)),
+        ):
+            with patch("jn80_librarian.app._prompt_yes_no") as mock_confirm:
+                _handle_f2(None, state)
+
+        self.assertIn("Invalid range", state.status)
+        mock_confirm.assert_not_called()
 
     def test_handle_receive_saves_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
