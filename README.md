@@ -10,8 +10,9 @@ Terminal SysEx librarian for Behringer JN-80 using a full-screen curses TUI.
 - MIDI output port selection with `F9` or `M`
 - Send with `F5` (choose bank/slot) or `F6` (next position)
 - Receive/download SysEx from synth with `F7` or `R`
+- Delete selected/highlighted `.syx` file(s) with `F8` (with confirmation)
 - In-memory rewrite of JN-80 DATA bank/slot bytes only
-- Session persistence for MIDI port, last written position, and last browsed dir
+- Session persistence for MIDI port, last written position, last F5 target, and last browsed dir
 
 ## Local setup (venv only)
 
@@ -29,6 +30,7 @@ python3 -m venv .venv
 ## Controls
 
 - `Arrow Up/Down`: Move cursor
+- `PgUp/PgDn`: Move cursor by one page
 - `Enter`: Open directory
 - `Ctrl-T`: Toggle selection on highlighted `.syx` file and move cursor down
 - `F2`: INIT erase presets in an inclusive bank/slot range (with confirmation)
@@ -36,6 +38,7 @@ python3 -m venv .venv
 - `F5`: Send highlighted/selected with bank+slot dialog
 - `F6`: Send highlighted/selected to next slot after last write
 - `F7` or `R`: Receive SysEx from synth and save as `.syx` in current folder
+- `F8`: Delete selected/highlighted `.syx` file(s) (with confirmation)
 - `?`: Show key help modal
 - `Q` or `F10`: Quit
 
@@ -44,8 +47,12 @@ python3 -m venv .venv
 - `.syx` files on disk are never modified.
 - During send, the destination write address and DATA bank/slot are rewritten in memory from the selected target.
 - F2 INIT sends an empty/blank JN-80 preset payload to each destination in the selected inclusive range.
+- During F2 INIT, a progress dialog shows live erase progress (`Progress: X/Y`, `Current: BNN`).
 - After each send, the app listens briefly for a SysEx reply and reports `ACK` or `No ACK`.
+- During F5/F6 send, the same dialog first shows live copy progress (`Progress: X/Y`, current file, target slot), then shows the final send result.
 - F5/F6 open a result dialog for clear send feedback; status is also mirrored in the bottom status bar.
+- F5 remembers the last bank/slot you entered (independent from F6/INIT write history).
+- F2 INIT does not update `Last`; only successful file sends (F5/F6) advance write history.
 - F5 bank/slot entry is constrained to valid values only (bank `A-T`, slot `01-20`).
 - In F5 bank/slot entry, typing a valid bank letter auto-advances focus to the slot digits.
 - F7/R opens a filename prompt, listens for incoming SysEx burst data, and saves captured dumps in the current directory.
@@ -67,6 +74,16 @@ python3 -m venv .venv
 This project is licensed under the MIT License. See the `LICENSE` file for details.
 
 ## Changelog
+
+### 1.2.0 - 2026-05-30
+
+- New features:
+  - Added `F8` delete flow for selected/highlighted `.syx` files with confirmation.
+  - Added `PgUp`/`PgDn` navigation in the browser with page-sized movement.
+  - Added live progress dialogs for send operations (`F5`/`F6`) and INIT erase (`F2`), with result shown in the same modal flow.
+  - Added independent persisted `F5` target memory (last entered bank/slot).
+- Bug fixes:
+  - INIT no longer updates `Last` write history (reserved for successful file sends).
 
 ### 1.1.0 - 2026-05-30
 

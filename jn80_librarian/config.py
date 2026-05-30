@@ -26,6 +26,7 @@ def config_path() -> Path:
 class AppConfig:
     last_midi_port: Optional[str] = None
     last_write: Optional[WritePosition] = None
+    last_f5_target: Optional[WritePosition] = None
     last_browsed_dir: Optional[str] = None
     last_init_from: Optional[WritePosition] = None
     last_init_to: Optional[WritePosition] = None
@@ -41,6 +42,13 @@ class AppConfig:
         else:
             data["last_write_bank"] = self.last_write.bank
             data["last_write_slot"] = self.last_write.slot
+
+        if self.last_f5_target is None:
+            data["last_f5_target_bank"] = None
+            data["last_f5_target_slot"] = None
+        else:
+            data["last_f5_target_bank"] = self.last_f5_target.bank
+            data["last_f5_target_slot"] = self.last_f5_target.slot
 
         if self.last_init_from is None:
             data["last_init_from_bank"] = None
@@ -72,6 +80,7 @@ class AppConfig:
                 return None
 
         last_write = _parse_position("last_write_bank", "last_write_slot")
+        last_f5_target = _parse_position("last_f5_target_bank", "last_f5_target_slot")
         last_init_from = _parse_position("last_init_from_bank", "last_init_from_slot")
         last_init_to = _parse_position("last_init_to_bank", "last_init_to_slot")
 
@@ -86,6 +95,7 @@ class AppConfig:
         return cls(
             last_midi_port=last_midi_port,
             last_write=last_write,
+            last_f5_target=last_f5_target,
             last_browsed_dir=last_browsed_dir,
             last_init_from=last_init_from,
             last_init_to=last_init_to,

@@ -14,6 +14,7 @@ class TestConfig(unittest.TestCase):
             cfg = AppConfig(
                 last_midi_port="JN80",
                 last_write=WritePosition("C", 7),
+                last_f5_target=WritePosition("B", 11),
                 last_browsed_dir="/tmp/patches",
                 last_init_from=WritePosition("D", 2),
                 last_init_to=WritePosition("E", 9),
@@ -25,6 +26,7 @@ class TestConfig(unittest.TestCase):
 
             self.assertEqual(loaded.last_midi_port, "JN80")
             self.assertEqual(loaded.last_write, WritePosition("C", 7))
+            self.assertEqual(loaded.last_f5_target, WritePosition("B", 11))
             self.assertEqual(loaded.last_browsed_dir, "/tmp/patches")
             self.assertEqual(loaded.last_init_from, WritePosition("D", 2))
             self.assertEqual(loaded.last_init_to, WritePosition("E", 9))
@@ -39,6 +41,7 @@ class TestConfig(unittest.TestCase):
 
             self.assertIsNone(loaded.last_midi_port)
             self.assertIsNone(loaded.last_write)
+            self.assertIsNone(loaded.last_f5_target)
             self.assertIsNone(loaded.last_browsed_dir)
             self.assertIsNone(loaded.last_init_from)
             self.assertIsNone(loaded.last_init_to)

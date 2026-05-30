@@ -4,7 +4,7 @@ import curses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .browser import BrowserEntry, list_entries
 from .config import AppConfig, load_config, save_config
@@ -22,6 +22,7 @@ class AppState:
     status: str = "Ready"
     selected_port: Optional[str] = None
     last_written: Optional[WritePosition] = None
+    last_f5_target: WritePosition = field(default_factory=lambda: WritePosition("A", 1))
     last_init_from: WritePosition = field(default_factory=lambda: WritePosition("A", 1))
     last_init_to: WritePosition = field(default_factory=lambda: WritePosition("A", 1))
     selection_order: dict[Path, int] = field(default_factory=dict)
@@ -56,6 +57,32 @@ def _current_entry(state: AppState) -> Optional[BrowserEntry]:
     if 0 <= state.cursor < len(state.entries):
         return state.entries[state.cursor]
     return None
+
+
+def _visible_list_height(stdscr: curses.window) -> int:
+    height, width = stdscr.getmaxyx()
+    has_box = height >= 7 and width >= 10
+    if has_box:
+        pane_top = 1
+        pane_bottom = height - 3
+        return max(1, pane_bottom - pane_top - 1)
+    return max(1, height - 3)
+
+
+def _move_cursor_page(state: AppState, page_size: int, direction: int) -> None:
+    if not state.entries:
+        return
+
+    step = max(1, page_size)
+    delta = step if direction > 0 else -step
+    state.cursor = max(0, min(len(state.entries) - 1, state.cursor + delta))
+
+
+def _page_down_pin_top(state: AppState, page_size: int) -> None:
+    _move_cursor_page(state, page_size, 1)
+    if state.entries:
+        max_scroll = max(0, len(state.entries) - max(1, page_size))
+        state.scroll = min(state.cursor, max_scroll)
 
 
 def _format_header_title(cwd: Path, draw_width: int) -> str:
@@ -152,6 +179,7 @@ def _draw(stdscr: curses.window, state: AppState) -> None:
         ("F5", "Send"),
         ("F6", "Next"),
         ("F7", "Receive"),
+        ("F8", "Delete"),
         ("F9/M", "Port"),
         ("F10", "Quit"),
         ("?", "Help"),
@@ -751,6 +779,7 @@ def _prompt_init_range(
                 else:
                     from_slot = f"{tens}{char}"
                     last_from_digit_field = field
+                    field = 3
                 continue
 
             tens = to_slot[0]
@@ -764,6 +793,7 @@ def _prompt_init_range(
             else:
                 to_slot = f"{tens}{char}"
                 last_to_digit_field = field
+                field = 0
     finally:
         try:
             curses.curs_set(0 if prev_cursor_state is None else prev_cursor_state)
@@ -776,15 +806,18 @@ def _show_help_modal(stdscr: curses.window) -> None:
         "JN-80 Librarian Keys",
         "",
         "Up/Down      Move cursor",
+        "PgUp/PgDn    Move one page",
         "Enter        Open directory",
         "Ctrl-T       Toggle selection + move down",
         "F2           INIT (erase) range",
-        "F9 or M      Select MIDI output port",
         "F5           Send with bank/slot prompt",
         "F6           Send to next position",
         "F7 or R      Receive SysEx from synth",
+        "F8           Delete selected/highlighted file(s)",
+        "F9 or M      Select MIDI output port",
+        "F10          Quit",
         "?            Show this help",
-        "Q or F10     Quit",
+        "Q            Quit",
         "",
         "Press any key to close",
     ]
@@ -891,8 +924,46 @@ def _target_files(state: AppState) -> list[Path]:
     return [entry.path]
 
 
+def _delete_files(state: AppState, files: list[Path]) -> tuple[bool, str]:
+    deleted_count = 0
+    errors: list[str] = []
+
+    for file_path in files:
+        try:
+            file_path.unlink()
+            deleted_count += 1
+            state.selection_order.pop(file_path, None)
+        except OSError as exc:
+            errors.append(f"{file_path.name}: {exc}")
+
+    if deleted_count == 0:
+        detail = errors[0] if errors else "No files were deleted"
+        return False, f"Delete failed: {detail}"
+
+    if len(files) == 1:
+        base = f"Deleted {files[0].name}"
+    else:
+        base = f"Deleted {deleted_count}/{len(files)} files"
+
+    if errors:
+        return False, f"{base} | Errors: {errors[0]}"
+    return True, base
+
+
 def _send_files(state: AppState, start_position: WritePosition) -> tuple[bool, str, Optional[WritePosition]]:
     files = _target_files(state)
+    if not files:
+        return False, "No .syx file selected", None
+
+    return _send_files_with_progress(state, files, start_position)
+
+
+def _send_files_with_progress(
+    state: AppState,
+    files: list[Path],
+    start_position: WritePosition,
+    on_progress: Optional[Callable[[int, int, Path, WritePosition], None]] = None,
+) -> tuple[bool, str, Optional[WritePosition]]:
     if not files:
         return False, "No .syx file selected", None
 
@@ -901,7 +972,8 @@ def _send_files(state: AppState, start_position: WritePosition) -> tuple[bool, s
     ack_count = 0
     last_ack_message: Optional[str] = None
 
-    for file_path in files:
+    total_files = len(files)
+    for index, file_path in enumerate(files, start=1):
         try:
             raw = load_syx_file(file_path)
             parsed = parse_sysex_message(raw)
@@ -921,6 +993,8 @@ def _send_files(state: AppState, start_position: WritePosition) -> tuple[bool, s
             last_ack_message = result.ack_message
 
         last_success = current
+        if on_progress is not None:
+            on_progress(index, total_files, file_path, current)
         current = increment_position(current)
 
     if len(files) == 1 and last_success is not None:
@@ -943,6 +1017,7 @@ def _send_init_range(
     state: AppState,
     start_position: WritePosition,
     end_position: WritePosition,
+    on_progress: Optional[Callable[[int, int, WritePosition], None]] = None,
 ) -> tuple[bool, str, Optional[WritePosition]]:
     positions = _positions_inclusive(start_position, end_position)
     if not positions:
@@ -956,7 +1031,8 @@ def _send_init_range(
     ack_count = 0
     last_ack_message: Optional[str] = None
 
-    for position in positions:
+    total_positions = len(positions)
+    for index, position in enumerate(positions, start=1):
         patched = patch_bank_slot_in_memory(parsed_empty, position)
         sysex_payload = to_mido_sysex_data(patched)
 
@@ -974,6 +1050,9 @@ def _send_init_range(
             ack_count += 1
             last_ack_message = result.ack_message
         last_success = position
+
+        if on_progress is not None:
+            on_progress(index, total_positions, position)
 
     if len(positions) == 1 and last_success is not None:
         base = f"Erased preset {_position_label(last_success)}"
@@ -1053,23 +1132,91 @@ def _choose_midi_port(stdscr: curses.window, state: AppState) -> None:
     state.status = f"MIDI port selected: {picked}"
 
 
-def _handle_f5(stdscr: curses.window, state: AppState) -> None:
-    prefill = "A1"
-    if state.last_written:
-        prefill = f"{state.last_written.bank}{state.last_written.slot}"
+def _handle_send_with_progress_dialog(
+    stdscr: Optional[curses.window],
+    state: AppState,
+    start: WritePosition,
+) -> None:
+    files = _target_files(state)
+    if not files:
+        state.status = "No .syx file selected"
+        _show_message_modal(stdscr, "Send Error", state.status)
+        return
+
+    modal: Optional[curses.window] = None
+    modal_w = 0
+    modal_h = 0
+
+    def _render_send_modal(title: str, lines: list[str], footer: str) -> None:
+        if modal is None:
+            return
+        inner_w = modal_w - 4
+        modal.erase()
+        modal.box()
+        modal.attron(curses.A_BOLD)
+        modal.addnstr(1, 2, _truncate_line(title, inner_w), inner_w)
+        modal.attroff(curses.A_BOLD)
+        for idx, line in enumerate(lines, start=2):
+            if idx >= modal_h - 1:
+                break
+            modal.addnstr(idx, 2, _truncate_line(line, inner_w), inner_w)
+        if footer:
+            modal.addnstr(modal_h - 2, 2, _truncate_line(footer, inner_w), inner_w)
+        modal.refresh()
+
+    def _render_send_progress(done: int, total: int, file_path: Path, current: WritePosition) -> None:
+        state.status = f"Sending {done}/{total}: {file_path.name} -> {_position_label(current)}"
+        _render_send_modal(
+            "Send Progress",
+            [
+                f"Progress: {done}/{total}",
+                f"File: {file_path.name}",
+                f"Target: {_position_label(current)}",
+            ],
+            "Please wait...",
+        )
+
+    if stdscr is not None:
+        height, width = stdscr.getmaxyx()
+        modal_h = min(10, max(8, height - 2))
+        modal_w = min(72, max(52, width - 4))
+        y = (height - modal_h) // 2
+        x = (width - modal_w) // 2
+        modal = curses.newwin(modal_h, modal_w, y, x)
+        modal.keypad(True)
+        _render_send_progress(0, len(files), files[0], start)
+
+    ok, message, last = _send_files_with_progress(state, files, start, on_progress=_render_send_progress)
+    state.status = message
+    if ok and last is not None:
+        state.last_written = last
+        state.selection_order.clear()
+
+    if modal is not None:
+        _render_send_modal(
+            "Send Result" if ok else "Send Error",
+            [message],
+            "Press any key to close",
+        )
+        modal.timeout(-1)
+        modal.getch()
+        return
+
+    _show_message_modal(stdscr, "Send Result" if ok else "Send Error", message)
+
+
+def _handle_f5(stdscr: Optional[curses.window], state: AppState) -> None:
+    prefill = f"{state.last_f5_target.bank}{state.last_f5_target.slot}"
 
     start_position = _prompt_bank_slot(stdscr, prefill)
     if start_position is None:
         state.status = "Send canceled"
         return
 
-    ok, message, last = _send_files(state, start_position)
-    state.status = message
-    if ok and last is not None:
-        state.last_written = last
-        state.selection_order.clear()
+    # F5 remembers last entered target independently from write-history tracking.
+    state.last_f5_target = start_position
 
-    _show_message_modal(stdscr, "Send Result" if ok else "Send Error", message)
+    _handle_send_with_progress_dialog(stdscr, state, start_position)
 
 
 def _handle_f6(stdscr: Optional[curses.window], state: AppState) -> None:
@@ -1078,16 +1225,37 @@ def _handle_f6(stdscr: Optional[curses.window], state: AppState) -> None:
     else:
         start = increment_position(state.last_written)
 
-    ok, message, last = _send_files(state, start)
-    state.status = message
-    if ok and last is not None:
-        state.last_written = last
-        state.selection_order.clear()
-
-    _show_message_modal(stdscr, "Send Result" if ok else "Send Error", message)
+    _handle_send_with_progress_dialog(stdscr, state, start)
 
 
 def _handle_f2(stdscr: Optional[curses.window], state: AppState) -> None:
+    modal: Optional[curses.window] = None
+    modal_w = 0
+    modal_h = 0
+
+    def _render_init_progress(done: int, total: int, current: Optional[WritePosition]) -> None:
+        if modal is None:
+            return
+        inner_w = modal_w - 4
+        range_line = f"Range: {_position_label(from_position)} -> {_position_label(to_position)}"
+        current_line = f"Current: {_position_label(current)}" if current is not None else "Current: --"
+        lines = [
+            range_line,
+            f"Progress: {done}/{total}",
+            current_line,
+        ]
+        modal.erase()
+        modal.box()
+        modal.attron(curses.A_BOLD)
+        modal.addnstr(1, 2, _truncate_line("INIT Progress", inner_w), inner_w)
+        modal.attroff(curses.A_BOLD)
+        for idx, line in enumerate(lines, start=2):
+            if idx >= modal_h - 1:
+                break
+            modal.addnstr(idx, 2, _truncate_line(line, inner_w), inner_w)
+        modal.addnstr(modal_h - 2, 2, _truncate_line("Please wait...", inner_w), inner_w)
+        modal.refresh()
+
     selected = _prompt_init_range(
         stdscr,
         f"{state.last_init_from.bank}{state.last_init_from.slot}",
@@ -1114,12 +1282,46 @@ def _handle_f2(stdscr: Optional[curses.window], state: AppState) -> None:
         state.status = "INIT canceled"
         return
 
-    ok, message, last = _send_init_range(state, from_position, to_position)
+    total_targets = len(_positions_inclusive(from_position, to_position))
+    state.status = f"INIT erasing 0/{total_targets}..."
+    if stdscr is not None:
+        height, width = stdscr.getmaxyx()
+        modal_h = min(10, max(8, height - 2))
+        modal_w = min(72, max(52, width - 4))
+        y = (height - modal_h) // 2
+        x = (width - modal_w) // 2
+        modal = curses.newwin(modal_h, modal_w, y, x)
+        modal.keypad(True)
+        _render_init_progress(0, total_targets, None)
+
+    def _on_init_progress(done: int, total: int, current: WritePosition) -> None:
+        state.status = f"INIT erasing {done}/{total}: {_position_label(current)}"
+        _render_init_progress(done, total, current)
+
+    ok, message, last = _send_init_range(state, from_position, to_position, on_progress=_on_init_progress)
     state.status = message
-    if ok and last is not None:
-        state.last_written = last
 
     _show_message_modal(stdscr, "INIT Result" if ok else "INIT Error", message)
+
+
+def _handle_f8(stdscr: Optional[curses.window], state: AppState) -> None:
+    files = _target_files(state)
+    if not files:
+        state.status = "No .syx file selected"
+        return
+
+    if len(files) == 1:
+        prompt = f"Delete file {files[0].name}?"
+    else:
+        prompt = f"Delete {len(files)} selected files?"
+
+    if not _prompt_yes_no(stdscr, "Confirm Delete", prompt):
+        state.status = "Delete canceled"
+        return
+
+    ok, message = _delete_files(state, files)
+    state.status = message
+    _refresh_entries(state)
 
 
 def _handle_receive(stdscr: Optional[curses.window], state: AppState) -> None:
@@ -1335,6 +1537,7 @@ def _persist(state: AppState) -> None:
         AppConfig(
             last_midi_port=state.selected_port,
             last_write=state.last_written,
+            last_f5_target=state.last_f5_target,
             last_browsed_dir=str(state.cwd),
             last_init_from=state.last_init_from,
             last_init_to=state.last_init_to,
@@ -1381,6 +1584,12 @@ def _app_loop(stdscr: curses.window, state: AppState) -> None:
             if state.entries:
                 state.cursor = min(len(state.entries) - 1, state.cursor + 1)
             continue
+        if ch == curses.KEY_PPAGE:
+            _move_cursor_page(state, _visible_list_height(stdscr), -1)
+            continue
+        if ch == curses.KEY_NPAGE:
+            _page_down_pin_top(state, _visible_list_height(stdscr))
+            continue
         if ch == curses.KEY_RESIZE:
             # Force a clean repaint on resize so all panes reflow immediately.
             try:
@@ -1416,6 +1625,10 @@ def _app_loop(stdscr: curses.window, state: AppState) -> None:
             _handle_receive(stdscr, state)
             _persist(state)
             continue
+        if ch == curses.KEY_F8:
+            _handle_f8(stdscr, state)
+            _persist(state)
+            continue
         if ch == ord("?"):
             _show_help_modal(stdscr)
             state.status = "Help"
@@ -1433,6 +1646,7 @@ def run() -> None:
         cwd=_safe_cwd(cfg),
         selected_port=cfg.last_midi_port,
         last_written=cfg.last_write,
+        last_f5_target=cfg.last_f5_target or WritePosition("A", 1),
         last_init_from=cfg.last_init_from or WritePosition("A", 1),
         last_init_to=cfg.last_init_to or WritePosition("A", 1),
     )
