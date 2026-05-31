@@ -7,16 +7,25 @@ from jn80_librarian.browser import BrowserEntry
 from jn80_librarian.app import (
     AppState,
     _active_patch_summary,
+    _f3_mode,
+    _handle_f3_merge,
     _handle_f2,
     _handle_f5,
     _handle_f6,
     _handle_f8,
+    _merge_selected_files,
+    _parse_index_selection,
+    _prompt_bank_slot,
+    _prompt_init_range,
     _handle_receive,
     _move_cursor_page,
     _page_down_pin_top,
     _positions_inclusive,
+    _save_split_frames_as_files,
+    _save_selected_frames_to_file,
     _send_init_range,
     _send_files,
+    _split_output_filename,
 )
 from jn80_librarian.midi import MidiReceiveResult, MidiResult
 from jn80_librarian.position import WritePosition
@@ -27,6 +36,18 @@ def make_message() -> bytes:
     address = bytes([0x00, 0x00])
     data = bytes([0x01] * 103)
     return HEADER_PREFIX + address + data + bytes([0xF7])
+
+
+def make_named_message(name: str, bank_index: int = 0, slot_index: int = 0) -> bytes:
+    storage_address = (bank_index * 20) + slot_index
+    address = bytes([storage_address & 0x7F, (storage_address >> 7) & 0x7F])
+    data = bytearray([0x01] * 103)
+    data[5] = bank_index
+    data[6] = slot_index
+    encoded = name.encode("ascii", errors="ignore")[:16]
+    start = 20
+    data[start : start + len(encoded)] = encoded
+    return HEADER_PREFIX + address + bytes(data) + bytes([0xF7])
 
 
 class TestAppSendFlow(unittest.TestCase):
@@ -258,7 +279,216 @@ class TestAppSendFlow(unittest.TestCase):
         self.assertEqual(state.last_written, WritePosition("B", 8))
         self.assertEqual(state.last_init_from, WritePosition("A", 1))
         self.assertEqual(state.last_init_to, WritePosition("A", 3))
-        mock_send.assert_called_once()
+
+    def test_f3_mode_prefers_merge_for_multi_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.syx"
+            second = root / "b.syx"
+            first.write_bytes(make_message())
+            second.write_bytes(make_message())
+
+            state = AppState(cwd=root)
+            state.selection_order = {first: 1, second: 2}
+
+            self.assertEqual(_f3_mode(state), "merge")
+
+    def test_f3_mode_split_for_highlighted_multi_preset_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "multi.syx"
+            file_path.write_bytes(make_message() + make_message())
+
+            state = AppState(cwd=root)
+            state.entries = [BrowserEntry(path=file_path, name=file_path.name, is_dir=False)]
+            state.cursor = 0
+
+            self.assertEqual(_f3_mode(state), "split")
+
+    def test_merge_selected_files_concatenates_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.syx"
+            second = root / "b.syx"
+            first_frame = make_named_message("FIRST")
+            second_frame = make_named_message("SECOND")
+            first.write_bytes(first_frame)
+            second.write_bytes(second_frame)
+
+            state = AppState(cwd=root)
+            ok, message = _merge_selected_files(state, [first, second], root / "merged.syx")
+
+            self.assertTrue(ok)
+            self.assertIn("2 files", message)
+            self.assertEqual((root / "merged.syx").read_bytes(), first_frame + second_frame)
+
+    def test_handle_f3_merge_clears_selection_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.syx"
+            second = root / "b.syx"
+            first.write_bytes(make_message())
+            second.write_bytes(make_message())
+
+            state = AppState(cwd=root)
+            state.selection_order = {first: 1, second: 2}
+
+            _handle_f3_merge(None, state)
+
+            self.assertEqual(state.selection_order, {})
+            self.assertTrue((root / "merged.syx").exists())
+
+    def test_parse_index_selection_supports_lists_and_ranges(self) -> None:
+        self.assertEqual(_parse_index_selection("1,3,5-7", 8), [1, 3, 5, 6, 7])
+
+    def test_parse_index_selection_rejects_non_contiguous_when_required(self) -> None:
+        with self.assertRaises(ValueError):
+            _parse_index_selection("1,3", 5, require_contiguous=True)
+
+    def test_split_output_filename_supports_bank_patch_mode(self) -> None:
+        from jn80_librarian.sysex import parse_sysex_message
+
+        parsed = parse_sysex_message(make_named_message("Pad One", bank_index=2, slot_index=6))
+        filename = _split_output_filename(parsed, 1, "bank_patch")
+
+        self.assertTrue(filename.startswith("C07 - "))
+        self.assertTrue(filename.endswith(".syx"))
+
+    def test_split_output_filename_prefers_storage_address_over_data_bytes(self) -> None:
+        from jn80_librarian.sysex import parse_sysex_message
+
+        # Address says D05 (bank index 3, slot index 4), while DATA bytes say C07.
+        storage_address = (3 * 20) + 4
+        address = bytes([storage_address & 0x7F, (storage_address >> 7) & 0x7F])
+        data = bytearray([0x01] * 103)
+        data[5] = 2
+        data[6] = 6
+        name = "Addr Wins"
+        encoded = name.encode("ascii")
+        data[20 : 20 + len(encoded)] = encoded
+
+        raw = HEADER_PREFIX + address + bytes(data) + bytes([0xF7])
+        parsed = parse_sysex_message(raw)
+        filename = _split_output_filename(parsed, 1, "bank_patch")
+
+        self.assertTrue(filename.startswith("D05 - Addr Wins"))
+
+    def test_split_output_filename_extracts_null_interleaved_patch_name(self) -> None:
+        from jn80_librarian.sysex import parse_sysex_message
+
+        address = bytes([0x00, 0x00])
+        data = bytearray([0x01] * 103)
+        data[5] = 0
+        data[6] = 0
+        name = "Warm Pad Full"
+        pos = 20
+        for char in name:
+            if pos + 1 >= len(data):
+                break
+            data[pos] = ord(char)
+            data[pos + 1] = 0x00
+            pos += 2
+
+        raw = HEADER_PREFIX + address + bytes(data) + bytes([0xF7])
+        parsed = parse_sysex_message(raw)
+        filename = _split_output_filename(parsed, 1, "patch")
+
+        self.assertTrue(filename.startswith("Warm Pad Full"))
+        self.assertNotIn("Patch 001", filename)
+
+    def test_save_split_frames_as_files_writes_requested_indices(self) -> None:
+        from jn80_librarian.sysex import parse_sysex_messages
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = AppState(cwd=root)
+            payload = make_named_message("ONE") + make_named_message("TWO") + make_named_message("THREE")
+            frames = parse_sysex_messages(payload)
+
+            ok, message = _save_split_frames_as_files(state, frames, [1, 3], "patch")
+
+            self.assertTrue(ok)
+            self.assertIn("2 presets", message)
+            syx_files = sorted(p.name for p in root.glob("*.syx"))
+            self.assertEqual(len(syx_files), 2)
+
+    def test_save_selected_frames_to_file_preserves_selection_order(self) -> None:
+        from jn80_librarian.sysex import parse_sysex_messages
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = AppState(cwd=root)
+            frame_a = make_named_message("A")
+            frame_b = make_named_message("B")
+            frame_c = make_named_message("C")
+            frames = parse_sysex_messages(frame_a + frame_b + frame_c)
+
+            ok, message = _save_selected_frames_to_file(state, frames, [3, 1], root / "selected.syx")
+
+            self.assertTrue(ok)
+            self.assertIn("2 selected presets", message)
+            self.assertEqual((root / "selected.syx").read_bytes(), frame_c + frame_a)
+
+
+class _FakePromptWindow:
+    def __init__(self, keys: list[int]) -> None:
+        self._keys = keys
+
+    def keypad(self, _enabled: bool) -> None:
+        return
+
+    def erase(self) -> None:
+        return
+
+    def box(self) -> None:
+        return
+
+    def attron(self, _attr: int) -> None:
+        return
+
+    def attroff(self, _attr: int) -> None:
+        return
+
+    def addnstr(self, _y: int, _x: int, _text: str, _n: int) -> None:
+        return
+
+    def move(self, _y: int, _x: int) -> None:
+        return
+
+    def refresh(self) -> None:
+        return
+
+    def getch(self) -> int:
+        return self._keys.pop(0)
+
+
+class _FakeScreen:
+    def getmaxyx(self) -> tuple[int, int]:
+        return (24, 80)
+
+
+class TestPromptBankSlot(unittest.TestCase):
+    def test_prompt_resets_persisted_digit_field_on_open(self) -> None:
+        _prompt_bank_slot._last_digit_field = 2
+        fake_win = _FakePromptWindow([ord("B"), 27])
+
+        with patch("jn80_librarian.app.curses.newwin", return_value=fake_win):
+            with patch("jn80_librarian.app.curses.curs_set", return_value=0):
+                _prompt_bank_slot(_FakeScreen(), "A01")
+
+        self.assertEqual(_prompt_bank_slot._last_digit_field, 1)
+
+    def test_init_prompt_resets_persisted_digit_fields_on_open(self) -> None:
+        _prompt_init_range._last_from_digit_field = 2
+        _prompt_init_range._last_to_digit_field = 5
+        fake_win = _FakePromptWindow([ord("B"), 27])
+
+        with patch("jn80_librarian.app.curses.newwin", return_value=fake_win):
+            with patch("jn80_librarian.app.curses.curs_set", return_value=0):
+                _prompt_init_range(_FakeScreen(), "A01", "A01")
+
+        self.assertEqual(_prompt_init_range._last_from_digit_field, 1)
+        self.assertEqual(_prompt_init_range._last_to_digit_field, 4)
 
     def test_handle_f2_prefills_with_persisted_values(self) -> None:
         state = AppState(

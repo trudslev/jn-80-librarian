@@ -51,18 +51,24 @@ Follow this workflow in order:
   - proposed release title.
   Do not commit/tag/push until user confirms.
 
-7. **Git Commit** - Stage all changes:
+7. **Release Notes Sync Check (Required)** - After curation and before commit/tag:
+  - Re-read the final `README.md` changelog entry for the target version (in case user edited it).
+  - Use that final approved text as the source of truth for release notes.
+  - If publishing via GitHub Release, copy this finalized entry into the release body.
+  - If GitHub release publishing is not available in the current environment (e.g. no auth), explicitly tell the user this was not published and provide exact notes text to paste.
+
+8. **Git Commit** - Stage all changes:
   ```
   git add .
   git commit -m "Release <VERSION>: <summary of changes>"
   ```
 
-8. **Tag Version** - Create annotated tag (must be plain semver with no leading 'v', e.g., `1.1.1`):
+9. **Tag Version** - Create annotated tag (must be plain semver with no leading 'v', e.g., `1.1.1`):
   ```
   git tag -a <VERSION> -m "Release <VERSION>"
   ```
 
-9. **Push** - Push commits and tags:
+10. **Push** - Push commits and tags:
   ```
   git push origin $(git rev-parse --abbrev-ref HEAD)
   git push origin --tags

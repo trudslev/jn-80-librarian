@@ -7,6 +7,7 @@ Terminal SysEx librarian for Behringer JN-80 using a full-screen curses TUI.
 - Full-screen file browser showing folders and `.syx` files only
 - Multi-select with `Ctrl-T`
 - INIT erase range with `F2` (bank/preset to bank/preset)
+- Context-aware `F3`: `MERGE` for multi-selection, `SPLIT` for multi-preset files
 - MIDI output port selection with `F9` or `M`
 - Send with `F5` (choose bank/slot) or `F6` (next position)
 - Receive/download SysEx from synth with `F7` or `R`
@@ -34,6 +35,12 @@ python3 -m venv .venv
 - `Enter`: Open directory
 - `Ctrl-T`: Toggle selection on highlighted `.syx` file and move cursor down
 - `F2`: INIT erase presets in an inclusive bank/slot range (with confirmation)
+- `F3`: Context action
+  - `MERGE` when more than one file is selected: merge all selected `.syx` into a new output file
+  - `SPLIT` when highlighted `.syx` has more than one preset:
+    - save all presets as separate files, or
+    - select presets from a patch list and save selected presets as separate files, or
+    - open a patch list selector and save selected presets as one new `.syx` file (in selected order)
 - `F9` or `M`: Open MIDI output port menu
 - `F5`: Send highlighted/selected with bank+slot dialog
 - `F6`: Send highlighted/selected to next slot after last write
@@ -60,6 +67,9 @@ python3 -m venv .venv
 - F2 INIT does not update `Last`; only successful file sends (F5/F6) advance write history.
 - F5 bank/slot entry is constrained to valid values only (bank `A-T`, slot `01-20`).
 - In F5 bank/slot entry, typing a valid bank letter auto-advances focus to the slot digits.
+- F3 label is context-aware: `MERGE` for multi-selection, `SPLIT` for highlighted multi-preset files, blank otherwise.
+- F3 MERGE preserves selection order and frame order while writing the merged output.
+- F3 SPLIT separate-file naming supports either patch-name filenames or `<bank><XX> - <patch name>` filenames.
 - F7/R opens a filename prompt, listens for incoming SysEx burst data, and saves captured dumps in the current directory.
   - The same fixed-size dialog stays open for filename entry, waiting/progress, and final result stats.
   - During waiting/receive, press any key to cancel the dump.
@@ -79,6 +89,16 @@ python3 -m venv .venv
 This project is licensed under the MIT License. See the `LICENSE` file for details.
 
 ## Changelog
+
+### 1.4.0 - 2026-05-31
+
+- New features:
+  - Added context-aware `F3` workflow with dynamic action label:
+    - `MERGE` when multiple `.syx` files are selected,
+    - `SPLIT` when highlighted file contains multiple presets,
+  - Added `F3 MERGE` flow to combine selected `.syx` files into a new output file in selection order and frame order.
+- Bug fixes:
+  - Reset persisted digit focus when opening both F5 bank/slot and F2 INIT dialogs.
 
 ### 1.3.0 - 2026-05-31
 

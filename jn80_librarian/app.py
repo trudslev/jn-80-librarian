@@ -103,6 +103,30 @@ def _active_patch_summary(state: AppState) -> Optional[str]:
     return f"Patches: {count}"
 
 
+def _f3_mode(state: AppState) -> str:
+    selected_files = [path for path in state.selection_order if path.exists() and path.is_file()]
+    if len(selected_files) > 1:
+        return "merge"
+
+    entry = _current_entry(state)
+    if not entry or entry.is_dir or entry.path.suffix.lower() != ".syx":
+        return "none"
+
+    count = _cached_patch_count(state, entry.path)
+    if count is not None and count > 1:
+        return "split"
+    return "none"
+
+
+def _f3_action_label(state: AppState) -> str:
+    mode = _f3_mode(state)
+    if mode == "merge":
+        return "MERGE"
+    if mode == "split":
+        return "SPLIT"
+    return ""
+
+
 def _visible_list_height(stdscr: curses.window) -> int:
     height, width = stdscr.getmaxyx()
     has_box = height >= 7 and width >= 10
@@ -218,8 +242,10 @@ def _draw(stdscr: curses.window, state: AppState) -> None:
             stdscr.attroff(curses.color_pair(4))
 
     usable_width = max(1, width - 1)
+    f3_label = _f3_action_label(state)
     segments = [
         ("F2", "Init"),
+        ("F3", f3_label),
         ("F5", "Send"),
         ("F6", "Next"),
         ("F7", "Receive"),
@@ -357,9 +383,9 @@ def _prompt_bank_slot(stdscr: Optional[curses.window], initial: str) -> Optional
 
     bank = starting.bank
     slot_text = f"{starting.slot:02d}"
-    last_digit_field = getattr(_prompt_bank_slot, "_last_digit_field", 1)
-    if last_digit_field not in (1, 2):
-        last_digit_field = 1
+    # Reset persisted digit focus each time the dialog opens.
+    last_digit_field = 1
+    _prompt_bank_slot._last_digit_field = last_digit_field
     field = 0
 
     prev_cursor_state: Optional[int] = None
@@ -556,6 +582,87 @@ def _select_from_menu(stdscr: curses.window, title: str, options: list[str], cur
             return None
 
 
+def _prompt_split_patch_selection(stdscr: Optional[curses.window], frames: list[ParsedSysEx]) -> Optional[list[int]]:
+    if stdscr is None:
+        return None
+    if not frames:
+        return []
+
+    height, width = stdscr.getmaxyx()
+    win_h = min(max(12, len(frames) + 6), max(12, height - 2))
+    win_w = min(120, max(70, width - 4))
+    y = max(0, (height - win_h) // 2)
+    x = max(0, (width - win_w) // 2)
+    win = curses.newwin(win_h, win_w, y, x)
+    win.keypad(True)
+
+    cursor = 0
+    scroll = 0
+    selected_order: dict[int, int] = {}
+    select_counter = 0
+    visible = max(1, win_h - 5)
+
+    while True:
+        if cursor < scroll:
+            scroll = cursor
+        if cursor >= scroll + visible:
+            scroll = cursor - visible + 1
+
+        win.erase()
+        win.box()
+        win.attron(curses.A_BOLD)
+        win.addnstr(1, 2, "Select presets for new .syx", win_w - 4)
+        win.attroff(curses.A_BOLD)
+        win.addnstr(2, 2, "Ctrl-T=Toggle+Down  Space=Toggle  Enter=Save  Esc=Cancel", win_w - 4)
+
+        for row, idx in enumerate(range(scroll, min(scroll + visible, len(frames))), start=3):
+            parsed = frames[idx]
+            marker = "*" if idx in selected_order else " "
+            bank_slot = _frame_bank_slot_label(parsed)
+            patch_name = _extract_patch_name(parsed, idx + 1)
+            line = f"{marker} {bank_slot} - {patch_name}"
+            if idx == cursor:
+                win.attron(curses.color_pair(1) | curses.A_BOLD)
+                win.addnstr(row, 2, line.ljust(win_w - 4), win_w - 4)
+                win.attroff(curses.color_pair(1) | curses.A_BOLD)
+            else:
+                win.addnstr(row, 2, line.ljust(win_w - 4), win_w - 4)
+
+        summary = f"Selected: {len(selected_order)}"
+        win.addnstr(win_h - 2, 2, summary.ljust(win_w - 4), win_w - 4)
+        win.refresh()
+
+        ch = win.getch()
+        if ch == curses.KEY_UP:
+            cursor = max(0, cursor - 1)
+            continue
+        if ch == curses.KEY_DOWN:
+            cursor = min(len(frames) - 1, cursor + 1)
+            continue
+        if ch == curses.KEY_PPAGE:
+            cursor = max(0, cursor - visible)
+            continue
+        if ch == curses.KEY_NPAGE:
+            cursor = min(len(frames) - 1, cursor + visible)
+            continue
+        if ch in (20, ord(" ")):
+            if cursor in selected_order:
+                del selected_order[cursor]
+            else:
+                select_counter += 1
+                selected_order[cursor] = select_counter
+            if ch == 20:
+                cursor = min(len(frames) - 1, cursor + 1)
+            continue
+        if ch in (10, 13):
+            if not selected_order:
+                curses.beep()
+                continue
+            return [idx + 1 for idx, _ in sorted(selected_order.items(), key=lambda item: item[1])]
+        if ch == 27:
+            return None
+
+
 def _prompt_yes_no(stdscr: Optional[curses.window], title: str, message: str) -> bool:
     if stdscr is None:
         return False
@@ -668,12 +775,11 @@ def _prompt_init_range(
     from_slot = f"{from_pos.slot:02d}"
     to_bank = to_pos.bank
     to_slot = f"{to_pos.slot:02d}"
-    last_from_digit_field = getattr(_prompt_init_range, "_last_from_digit_field", 1)
-    if last_from_digit_field not in (1, 2):
-        last_from_digit_field = 1
-    last_to_digit_field = getattr(_prompt_init_range, "_last_to_digit_field", 4)
-    if last_to_digit_field not in (4, 5):
-        last_to_digit_field = 4
+    # Reset persisted digit focus each time the INIT dialog opens.
+    last_from_digit_field = 1
+    last_to_digit_field = 4
+    _prompt_init_range._last_from_digit_field = last_from_digit_field
+    _prompt_init_range._last_to_digit_field = last_to_digit_field
     # Always start with the first bank field selected when opening.
     field = 0
 
@@ -861,6 +967,7 @@ def _show_help_modal(stdscr: curses.window) -> None:
         "Enter        Open directory",
         "Ctrl-T       Toggle selection + move down",
         "F2           INIT (erase) range",
+        "F3           MERGE (>1 selected) / SPLIT (multi-preset file)",
         "F5           Send with bank/slot prompt",
         "F6           Send to next position",
         "F7 or R      Receive SysEx from synth",
@@ -959,6 +1066,170 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def _sanitize_filename(text: str, fallback: str) -> str:
+    cleaned = "".join(ch for ch in text if ch not in '<>:"/\\|?*' and ord(ch) >= 32)
+    cleaned = " ".join(cleaned.split()).strip().rstrip(".")
+    return cleaned or fallback
+
+
+def _extract_patch_name(parsed: ParsedSysEx, index: int) -> str:
+    data = parsed.raw[parsed.data_start : -1]
+    def _best_printable_run(payload: bytes) -> str:
+        best = ""
+        current: list[str] = []
+
+        def _finish_run() -> None:
+            nonlocal best, current
+            candidate = "".join(current).strip()
+            if len(candidate) >= 4 and len(candidate) > len(best):
+                best = candidate
+            current = []
+
+        for value in payload:
+            if 32 <= value <= 126:
+                current.append(chr(value))
+            else:
+                _finish_run()
+        _finish_run()
+        return best
+
+    best_raw = _best_printable_run(data)
+    best_null_stripped = _best_printable_run(bytes(value for value in data if value != 0))
+    best = best_null_stripped if len(best_null_stripped) > len(best_raw) else best_raw
+
+    if best:
+        return best[:48]
+    return f"Patch {index:03d}"
+
+
+def _frame_bank_slot_label(parsed: ParsedSysEx) -> str:
+    address_low = parsed.raw[len(HEADER_PREFIX)]
+    address_high = parsed.raw[len(HEADER_PREFIX) + 1]
+    storage_address = address_low + (address_high << 7)
+    total_slots = len(BANKS) * 20
+    if 0 <= storage_address < total_slots:
+        bank_idx = storage_address // 20
+        slot_idx = storage_address % 20
+        return f"{BANKS[bank_idx]}{slot_idx + 1:02d}"
+
+    bank_idx = parsed.raw[parsed.data_start + 5]
+    slot_idx = parsed.raw[parsed.data_start + 6]
+    if 0 <= bank_idx < len(BANKS) and 0 <= slot_idx < 20:
+        return f"{BANKS[bank_idx]}{slot_idx + 1:02d}"
+    return "X00"
+
+
+def _split_output_filename(parsed: ParsedSysEx, index: int, naming_mode: str) -> str:
+    patch_name = _sanitize_filename(_extract_patch_name(parsed, index), f"Patch {index:03d}")
+    if naming_mode == "bank_patch":
+        prefix = _frame_bank_slot_label(parsed)
+        stem = _sanitize_filename(f"{prefix} - {patch_name}", f"{prefix} - Patch {index:03d}")
+    else:
+        stem = patch_name
+    return f"{stem}.syx"
+
+
+def _parse_index_selection(text: str, total: int, require_contiguous: bool = False) -> list[int]:
+    cleaned = text.strip().replace(" ", "")
+    if not cleaned:
+        raise ValueError("Selection cannot be empty")
+
+    selected: set[int] = set()
+    for part in cleaned.split(","):
+        if not part:
+            raise ValueError("Invalid selection format")
+        if "-" in part:
+            bits = part.split("-")
+            if len(bits) != 2 or not bits[0] or not bits[1]:
+                raise ValueError("Invalid range format")
+            start = int(bits[0])
+            end = int(bits[1])
+            if start > end:
+                raise ValueError("Range start must be <= end")
+            for value in range(start, end + 1):
+                selected.add(value)
+        else:
+            selected.add(int(part))
+
+    ordered = sorted(selected)
+    if not ordered:
+        raise ValueError("Selection cannot be empty")
+    if ordered[0] < 1 or ordered[-1] > total:
+        raise ValueError(f"Selection must be within 1-{total}")
+    if require_contiguous and ordered != list(range(ordered[0], ordered[-1] + 1)):
+        raise ValueError("Range must be contiguous")
+    return ordered
+
+
+def _merge_selected_files(state: AppState, files: list[Path], target: Path) -> tuple[bool, str]:
+    frames: list[bytes] = []
+    for file_path in files:
+        try:
+            raw = load_syx_file(file_path)
+            parsed_frames = parse_sysex_messages(raw)
+        except OSError as exc:
+            return False, f"File error: {exc}"
+        except ValueError as exc:
+            return False, str(exc)
+        for parsed in parsed_frames:
+            frames.append(parsed.raw)
+
+    if not frames:
+        return False, "No SysEx frames found in selected files"
+
+    output = _unique_path(target)
+    try:
+        output.write_bytes(b"".join(frames))
+    except OSError as exc:
+        return False, f"Failed to save merged file: {exc}"
+    return True, f"Merged {len(files)} files ({len(frames)} presets) -> {output.name}"
+
+
+def _save_split_frames_as_files(
+    state: AppState,
+    frames: list[ParsedSysEx],
+    indices: list[int],
+    naming_mode: str,
+) -> tuple[bool, str]:
+    written = 0
+    first_name = ""
+    last_name = ""
+    for one_based in indices:
+        parsed = frames[one_based - 1]
+        file_name = _split_output_filename(parsed, one_based, naming_mode)
+        target = _unique_path(state.cwd / file_name)
+        try:
+            target.write_bytes(parsed.raw)
+        except OSError as exc:
+            return False, f"Failed to save split file: {exc}"
+        written += 1
+        if not first_name:
+            first_name = target.name
+        last_name = target.name
+
+    if written == 1:
+        return True, f"Split saved 1 preset -> {first_name}"
+    return True, f"Split saved {written} presets -> {first_name} ... {last_name}"
+
+
+def _save_selected_frames_to_file(
+    state: AppState,
+    frames: list[ParsedSysEx],
+    indices: list[int],
+    target: Path,
+) -> tuple[bool, str]:
+    if not indices:
+        return False, "No presets selected"
+
+    output = _unique_path(target)
+    payload = b"".join(frames[index - 1].raw for index in indices)
+    try:
+        output.write_bytes(payload)
+    except OSError as exc:
+        return False, f"Failed to save output file: {exc}"
+    return True, f"Saved {len(indices)} selected presets -> {output.name}"
 
 
 def _target_files(state: AppState) -> list[Path]:
@@ -1421,6 +1692,145 @@ def _handle_f2(stdscr: Optional[curses.window], state: AppState) -> None:
     modal.getch()
 
 
+def _handle_f3_merge(stdscr: Optional[curses.window], state: AppState) -> None:
+    files = [
+        path
+        for path, _ in sorted(state.selection_order.items(), key=lambda item: item[1])
+        if path.exists() and path.is_file()
+    ]
+    if len(files) <= 1:
+        state.status = "F3 MERGE requires more than one selected file"
+        return
+
+    default_name = "merged.syx"
+    if stdscr is None:
+        chosen = default_name
+    else:
+        chosen = _prompt_text(stdscr, "Merge to filename", default_name)
+        if chosen is None:
+            state.status = "MERGE canceled"
+            return
+
+    filename = chosen.strip()
+    if not filename:
+        state.status = "MERGE canceled"
+        return
+    if not filename.lower().endswith(".syx"):
+        filename += ".syx"
+
+    ok, message = _merge_selected_files(state, files, state.cwd / filename)
+    state.status = message
+    if ok:
+        state.selection_order.clear()
+        _refresh_entries(state)
+    _show_message_modal(stdscr, "MERGE Result" if ok else "MERGE Error", message)
+
+
+def _handle_f3_split(stdscr: Optional[curses.window], state: AppState) -> None:
+    entry = _current_entry(state)
+    if not entry or entry.is_dir or entry.path.suffix.lower() != ".syx":
+        state.status = "F3 SPLIT requires highlighted .syx with multiple presets"
+        return
+
+    try:
+        source_raw = load_syx_file(entry.path)
+        frames = parse_sysex_messages(source_raw)
+    except (OSError, ValueError) as exc:
+        state.status = str(exc)
+        _show_message_modal(stdscr, "SPLIT Error", state.status)
+        return
+
+    if len(frames) <= 1:
+        state.status = "F3 SPLIT requires a file with more than one preset"
+        return
+
+    if stdscr is None:
+        state.status = "SPLIT requires interactive mode"
+        return
+
+    action = _select_from_menu(
+        stdscr,
+        "SPLIT options",
+        [
+            "Save all presets as separate files",
+            "Save selected presets as separate files",
+            "Save selected presets as one .syx file",
+        ],
+        None,
+    )
+    if action is None:
+        state.status = "SPLIT canceled"
+        return
+
+    if action in (
+        "Save all presets as separate files",
+        "Save selected presets as separate files",
+    ):
+        naming_choice = _select_from_menu(
+            stdscr,
+            "Split filename style",
+            [
+                "Patch name",
+                "<bank><XX> - <patch name>",
+            ],
+            "Patch name",
+        )
+        if naming_choice is None:
+            state.status = "SPLIT canceled"
+            return
+        naming_mode = "bank_patch" if naming_choice == "<bank><XX> - <patch name>" else "patch"
+
+        if action == "Save all presets as separate files":
+            indices = list(range(1, len(frames) + 1))
+        else:
+            selected_indices = _prompt_split_patch_selection(stdscr, frames)
+            if selected_indices is None:
+                state.status = "SPLIT canceled"
+                return
+            indices = selected_indices
+
+        ok, message = _save_split_frames_as_files(state, frames, indices, naming_mode)
+        state.status = message
+        if ok:
+            _refresh_entries(state)
+        _show_message_modal(stdscr, "SPLIT Result" if ok else "SPLIT Error", message)
+        return
+
+    selected_indices = _prompt_split_patch_selection(stdscr, frames)
+    if selected_indices is None:
+        state.status = "SPLIT canceled"
+        return
+
+    default_name = f"{entry.path.stem}_selected.syx"
+    target_name = _prompt_text(stdscr, "Output filename", default_name)
+    if target_name is None:
+        state.status = "SPLIT canceled"
+        return
+    filename = target_name.strip()
+    if not filename:
+        state.status = "SPLIT canceled"
+        return
+    if not filename.lower().endswith(".syx"):
+        filename += ".syx"
+
+    ok, message = _save_selected_frames_to_file(state, frames, selected_indices, state.cwd / filename)
+    state.status = message
+    if ok:
+        _refresh_entries(state)
+    _show_message_modal(stdscr, "SPLIT Result" if ok else "SPLIT Error", message)
+
+
+def _handle_f3(stdscr: Optional[curses.window], state: AppState) -> None:
+    mode = _f3_mode(state)
+    if mode == "merge":
+        _handle_f3_merge(stdscr, state)
+        return
+    if mode == "split":
+        _handle_f3_split(stdscr, state)
+        return
+    state.status = "F3 unavailable for current selection"
+
+
 def _handle_f8(stdscr: Optional[curses.window], state: AppState) -> None:
     files = _target_files(state)
     if not files:
@@ -1734,6 +2144,10 @@ def _app_loop(stdscr: curses.window, state: AppState) -> None:
             continue
         if ch == curses.KEY_F2:
             _handle_f2(stdscr, state)
+            _persist(state)
+            continue
+        if ch == curses.KEY_F3:
+            _handle_f3(stdscr, state)
             _persist(state)
             continue
         if ch == curses.KEY_F5:
