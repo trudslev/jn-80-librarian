@@ -5,6 +5,7 @@ from jn80_librarian.sysex import (
     HEADER_PREFIX,
     patch_bank_slot_in_memory,
     parse_sysex_message,
+    parse_sysex_messages,
 )
 
 
@@ -56,6 +57,34 @@ class TestSysex(unittest.TestCase):
         hex_text = " ".join(f"{b:02X}" for b in make_message()).encode("ascii")
         parsed = parse_sysex_message(hex_text)
         self.assertEqual(parsed.raw, make_message())
+
+    def test_parse_multiple_frames_from_binary(self) -> None:
+        frame_a = make_message()
+        frame_b = make_message()
+        raw = bytes([0x01, 0x02]) + frame_a + bytes([0x03]) + frame_b
+
+        parsed = parse_sysex_messages(raw)
+
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0].raw, frame_a)
+        self.assertEqual(parsed[1].raw, frame_b)
+
+    def test_parse_multiple_frames_from_ascii_hex_dump(self) -> None:
+        frame_a = make_message()
+        frame_b = make_message()
+        hex_text = " ".join(f"{b:02X}" for b in (frame_a + frame_b)).encode("ascii")
+
+        parsed = parse_sysex_messages(hex_text)
+
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0].raw, frame_a)
+        self.assertEqual(parsed[1].raw, frame_b)
+
+    def test_parse_sysex_message_returns_first_frame_when_multiple_present(self) -> None:
+        frame_a = make_message()
+        frame_b = make_message()
+        parsed = parse_sysex_message(frame_a + frame_b)
+        self.assertEqual(parsed.raw, frame_a)
 
 
 if __name__ == "__main__":

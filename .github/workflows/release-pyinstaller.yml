@@ -112,8 +112,72 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Derive release metadata from README changelog
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes_file="${RUNNER_TEMP}/release-notes-${tag}.md"
+
+          changelog_section=$(awk -v tag="$tag" '
+            $0 ~ "^### " tag " - " { in_section=1; next }
+            in_section && $0 ~ "^### " { exit }
+            in_section { print }
+          ' README.md)
+
+          if [[ -z "${changelog_section}" ]]; then
+            {
+              echo "No changelog entries found in README.md for this tag."
+            } > "${notes_file}"
+            release_name="JN-80 Librarian ${tag}"
+          else
+            notes_body=$(printf '%s\n' "${changelog_section}" | awk 'found || NF { found=1; print }')
+            printf '%s\n' "${notes_body}" > "${notes_file}"
+
+            commit_subject=$(git log -1 --pretty=%s)
+            if [[ "${commit_subject}" =~ ^Release[[:space:]]+${tag}:[[:space:]]+(.+)$ ]]; then
+              release_title="${BASH_REMATCH[1]}"
+              release_name="${release_title}"
+            else
+              first_change=$(printf '%s\n' "${changelog_section}" | sed -n 's/^  - //p' | head -n 1)
+              if [[ -z "${first_change}" ]]; then
+                first_change=$(printf '%s\n' "${changelog_section}" | sed -n 's/^- //p' | head -n 1)
+              fi
+
+              if [[ -n "${first_change}" ]]; then
+                # Keep fallback titles readable: strip markdown tokens and trim at word boundary.
+                first_change=$(printf '%s' "${first_change}" | sed -E 's/[`*_]+//g; s/\[[^]]+\]\(([^)]+)\)/\1/g')
+                first_change=$(printf '%s' "${first_change}" | awk '{$1=$1; print}')
+                max_change_len=72
+                if (( ${#first_change} > max_change_len )); then
+                  trimmed=$(printf '%s' "${first_change:0:max_change_len}" | sed -E 's/[[:space:]][^[:space:]]*$//')
+                  if [[ -n "${trimmed}" ]]; then
+                    first_change="${trimmed}..."
+                  else
+                    first_change="${first_change:0:max_change_len}..."
+                  fi
+                fi
+                release_name="${first_change}"
+              else
+                release_name="JN-80 Librarian"
+              fi
+            fi
+          fi
+
+          # Keep title concise for GitHub release UI.
+          release_name="${release_name:0:120}"
+
+          {
+            echo "release_name=${release_name}"
+            echo "notes_path=${notes_file}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Upload executable to GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.release_meta.outputs.release_name }}
+          body_path: ${{ steps.release_meta.outputs.notes_path }}
+          draft: false
           files: ${{ steps.prepare_asset.outputs.upload_files }}
           fail_on_unmatched_files: true

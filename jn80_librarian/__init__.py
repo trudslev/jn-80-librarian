@@ -1,6 +1,8 @@
 """JN-80 terminal SysEx librarian."""
 
-__all__ = ["run"]
+__version__ = "1.3.0"
+
+__all__ = ["run", "__version__"]
 
 
 def run() -> None:

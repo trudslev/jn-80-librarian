@@ -6,6 +6,7 @@ from unittest.mock import patch
 from jn80_librarian.browser import BrowserEntry
 from jn80_librarian.app import (
     AppState,
+    _active_patch_summary,
     _handle_f2,
     _handle_f5,
     _handle_f6,
@@ -29,6 +30,37 @@ def make_message() -> bytes:
 
 
 class TestAppSendFlow(unittest.TestCase):
+    def test_active_patch_summary_reports_patch_count_for_highlighted_syx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "multi.syx"
+            file_path.write_bytes(make_message() + make_message())
+
+            state = AppState(cwd=root)
+            state.entries = [BrowserEntry(path=file_path, name=file_path.name, is_dir=False)]
+            state.cursor = 0
+
+            self.assertEqual(_active_patch_summary(state), "Patches: 2")
+
+    def test_active_patch_summary_reports_invalid_for_bad_syx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "bad.syx"
+            file_path.write_bytes(b"not-a-valid-sysex")
+
+            state = AppState(cwd=root)
+            state.entries = [BrowserEntry(path=file_path, name=file_path.name, is_dir=False)]
+            state.cursor = 0
+
+            self.assertEqual(_active_patch_summary(state), "Patches: invalid")
+
+    def test_active_patch_summary_is_none_for_directories(self) -> None:
+        state = AppState(cwd=Path.cwd())
+        state.entries = [BrowserEntry(path=Path.cwd(), name=".", is_dir=True)]
+        state.cursor = 0
+
+        self.assertIsNone(_active_patch_summary(state))
+
     def test_positions_inclusive_builds_cross_bank_range(self) -> None:
         positions = _positions_inclusive(WritePosition("A", 19), WritePosition("B", 2))
         self.assertEqual(
@@ -120,6 +152,44 @@ class TestAppSendFlow(unittest.TestCase):
             ordered_paths = [call.args[0] for call in mock_load.call_args_list]
             self.assertEqual(ordered_paths, [first, second])
 
+    def test_send_files_sends_all_presets_in_single_multi_frame_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "multi.syx"
+            file_path.write_bytes(make_message() + make_message())
+
+            state = AppState(cwd=root, selected_port="JN80")
+            state.selection_order = {file_path: 1}
+
+            with patch(
+                "jn80_librarian.app.send_sysex",
+                return_value=MidiResult(True, "ok", ack_received=True, ack_message="JN-80 reply: 00"),
+            ) as mock_send:
+                ok, message, last = _send_files(state, WritePosition("A", 1))
+
+            self.assertTrue(ok)
+            self.assertEqual(last, WritePosition("A", 2))
+            self.assertEqual(mock_send.call_count, 2)
+            self.assertIn("Sent 2 presets", message)
+            self.assertIn("ACK 2/2", message)
+
+    def test_send_files_blocks_when_destination_capacity_is_insufficient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "overflow.syx"
+            file_path.write_bytes(make_message() + make_message())
+
+            state = AppState(cwd=root, selected_port="JN80")
+            state.selection_order = {file_path: 1}
+
+            with patch("jn80_librarian.app.send_sysex") as mock_send:
+                ok, message, last = _send_files(state, WritePosition("T", 20))
+
+            self.assertFalse(ok)
+            self.assertIsNone(last)
+            self.assertIn("Not enough destination slots", message)
+            mock_send.assert_not_called()
+
     def test_handle_f5_clears_selection_on_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -158,6 +228,17 @@ class TestAppSendFlow(unittest.TestCase):
 
         self.assertEqual(state.last_written, WritePosition("A", 1))
         self.assertEqual(state.selection_order, {file_path: 1})
+
+    def test_handle_f6_stops_at_t20_without_wrapping(self) -> None:
+        state = AppState(cwd=Path.cwd(), selected_port="JN80")
+        state.last_written = WritePosition("T", 20)
+
+        with patch("jn80_librarian.app._send_files_with_progress") as mock_send:
+            _handle_f6(None, state)
+
+        self.assertIn("no next slot", state.status.lower())
+        self.assertEqual(state.last_written, WritePosition("T", 20))
+        mock_send.assert_not_called()
 
     def test_handle_f2_does_not_set_last_written_on_success(self) -> None:
         state = AppState(cwd=Path.cwd(), selected_port="JN80", last_written=WritePosition("B", 8))

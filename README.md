@@ -47,10 +47,15 @@ python3 -m venv .venv
 - `.syx` files on disk are never modified.
 - During send, the destination write address and DATA bank/slot are rewritten in memory from the selected target.
 - F2 INIT sends an empty/blank JN-80 preset payload to each destination in the selected inclusive range.
-- During F2 INIT, a progress dialog shows live erase progress (`Progress: X/Y`, `Current: BNN`).
+- During F2 INIT, one modal handles confirmation, live erase progress (`Progress: X/Y`, `Current: BNN`), and final result.
 - After each send, the app listens briefly for a SysEx reply and reports `ACK` or `No ACK`.
 - During F5/F6 send, the same dialog first shows live copy progress (`Progress: X/Y`, current file, target slot), then shows the final send result.
 - F5/F6 open a result dialog for clear send feedback; status is also mirrored in the bottom status bar.
+- When a `.syx` file is highlighted, the status bar shows its detected patch count (`Patches: N`).
+- F5/F6 send every SysEx frame found in each selected `.syx` file (not just the first frame).
+- Frames are sent in deterministic order: selected file order (selection timestamp), then frame order within each file.
+- Before F5/F6 send starts, destination capacity is validated from the selected start slot through `T20`; if there is not enough room for all frames, send is blocked before any write.
+- F6 does not wrap after `T20`; if `Last` is `T20`, `F6` stops with an error instead of writing to `A01`.
 - F5 remembers the last bank/slot you entered (independent from F6/INIT write history).
 - F2 INIT does not update `Last`; only successful file sends (F5/F6) advance write history.
 - F5 bank/slot entry is constrained to valid values only (bank `A-T`, slot `01-20`).
@@ -66,14 +71,23 @@ python3 -m venv .venv
 - Receive result dialog shows details: selected port, received patch count, JN-80 frame count, saved file count, and saved filename range.
 - Errors are displayed in the send result dialog and the bottom status bar.
 - A dedicated F-key help strip is shown above the status bar for quick command reminders.
-- If an unmapped key is pressed, status shows the key name and suggests pressing `?` for help.
 - Directory rows are prefixed with `/`, and selected files are shown in yellow.
+- The top bar shows the running app version next to the title.
 
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.
 
 ## Changelog
+
+### 1.3.0 - 2026-05-31
+
+- New features:
+  - Added multi-frame `.syx` send support: `F5`/`F6` now sends all SysEx frames found in each selected file, in deterministic order.
+  - Added active file patch-count indicator in the status bar (`Patches: N` / `Patches: invalid`).
+  - Added app version display in the top title bar.
+- Bug fixes:
+  - Prevented `F6` from wrapping from `T20` to `A01`; copy-next now stops with an explicit error at end-of-memory.
 
 ### 1.2.0 - 2026-05-30
 

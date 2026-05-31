@@ -66,18 +66,30 @@ def _extract_first_frame(raw: bytes) -> bytes:
     return raw[start : end + 1]
 
 
-def parse_sysex_message(raw: bytes) -> ParsedSysEx:
-    normalized = raw
-    if not normalized:
-        raise ValueError("Invalid .syx file: empty file")
+def _extract_frames(raw: bytes) -> list[bytes]:
+    frames: list[bytes] = []
+    pos = 0
 
-    if normalized[0] != F0 or normalized[-1] != F7:
-        parsed_hex = _parse_ascii_hex(normalized)
-        if parsed_hex is not None:
-            normalized = parsed_hex
+    while True:
+        try:
+            start = raw.index(F0, pos)
+        except ValueError:
+            break
 
-    normalized = _extract_first_frame(normalized)
+        try:
+            end = raw.index(F7, start + 1)
+        except ValueError as exc:
+            raise ValueError("Invalid .syx file: missing F7 end byte") from exc
 
+        frames.append(raw[start : end + 1])
+        pos = end + 1
+
+    if not frames:
+        raise ValueError("Invalid .syx file: missing F0 start byte")
+    return frames
+
+
+def _validate_frame(normalized: bytes) -> ParsedSysEx:
     if len(normalized) < DATA_START_INDEX + SLOT_DATA_OFFSET + 1 + 1:
         raise ValueError("Invalid .syx file: message too short")
     if normalized[0] != F0:
@@ -92,6 +104,24 @@ def parse_sysex_message(raw: bytes) -> ParsedSysEx:
             raise ValueError(f"Invalid .syx file: non-7-bit payload at index {idx}")
 
     return ParsedSysEx(raw=normalized)
+
+
+def parse_sysex_messages(raw: bytes) -> list[ParsedSysEx]:
+    normalized = raw
+    if not normalized:
+        raise ValueError("Invalid .syx file: empty file")
+
+    if normalized[0] != F0 or normalized[-1] != F7:
+        parsed_hex = _parse_ascii_hex(normalized)
+        if parsed_hex is not None:
+            normalized = parsed_hex
+
+    frames = _extract_frames(normalized)
+    return [_validate_frame(frame) for frame in frames]
+
+
+def parse_sysex_message(raw: bytes) -> ParsedSysEx:
+    return parse_sysex_messages(raw)[0]
 
 
 def patch_bank_slot_in_memory(parsed: ParsedSysEx, position: WritePosition) -> bytes:

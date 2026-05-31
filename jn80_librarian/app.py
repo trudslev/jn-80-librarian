@@ -6,11 +6,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import __version__
 from .browser import BrowserEntry, list_entries
 from .config import AppConfig, load_config, save_config
 from .midi import list_output_ports, receive_sysex, send_sysex
 from .position import BANKS, WritePosition, increment_position
-from .sysex import HEADER_PREFIX, load_syx_file, parse_sysex_message, patch_bank_slot_in_memory, to_mido_sysex_data
+from .sysex import (
+    HEADER_PREFIX,
+    ParsedSysEx,
+    load_syx_file,
+    parse_sysex_message,
+    parse_sysex_messages,
+    patch_bank_slot_in_memory,
+    to_mido_sysex_data,
+)
 
 
 @dataclass
@@ -27,6 +36,7 @@ class AppState:
     last_init_to: WritePosition = field(default_factory=lambda: WritePosition("A", 1))
     selection_order: dict[Path, int] = field(default_factory=dict)
     select_counter: int = 0
+    patch_count_cache: dict[Path, tuple[int, int, Optional[int]]] = field(default_factory=dict)
 
     @property
     def selected_count(self) -> int:
@@ -59,6 +69,40 @@ def _current_entry(state: AppState) -> Optional[BrowserEntry]:
     return None
 
 
+def _cached_patch_count(state: AppState, path: Path) -> Optional[int]:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+
+    cache_key = (stat_result.st_mtime_ns, stat_result.st_size)
+    cached = state.patch_count_cache.get(path)
+    if cached and cached[0] == cache_key[0] and cached[1] == cache_key[1]:
+        return cached[2]
+
+    try:
+        raw = load_syx_file(path)
+        count = len(parse_sysex_messages(raw))
+    except (OSError, ValueError):
+        count = None
+
+    state.patch_count_cache[path] = (cache_key[0], cache_key[1], count)
+    return count
+
+
+def _active_patch_summary(state: AppState) -> Optional[str]:
+    entry = _current_entry(state)
+    if not entry or entry.is_dir:
+        return None
+    if entry.path.suffix.lower() != ".syx":
+        return None
+
+    count = _cached_patch_count(state, entry.path)
+    if count is None:
+        return "Patches: invalid"
+    return f"Patches: {count}"
+
+
 def _visible_list_height(stdscr: curses.window) -> int:
     height, width = stdscr.getmaxyx()
     has_box = height >= 7 and width >= 10
@@ -89,7 +133,7 @@ def _format_header_title(cwd: Path, draw_width: int) -> str:
     if draw_width <= 0:
         return ""
 
-    prefix = " JN-80 Librarian | "
+    prefix = f" JN-80 Librarian v{__version__} | "
     suffix = " "
     cwd_text = str(cwd)
     available = draw_width - len(prefix) - len(suffix)
@@ -180,7 +224,7 @@ def _draw(stdscr: curses.window, state: AppState) -> None:
         ("F6", "Next"),
         ("F7", "Receive"),
         ("F8", "Delete"),
-        ("F9/M", "Port"),
+        ("F9", "Port"),
         ("F10", "Quit"),
         ("?", "Help"),
     ]
@@ -222,8 +266,10 @@ def _draw(stdscr: curses.window, state: AppState) -> None:
         if state.last_written
         else "--"
     )
+    patch_summary = _active_patch_summary(state)
+    patch_segment = f" | {patch_summary}" if patch_summary else ""
     status = (
-        f" Port: {port} | Last: {last} | Selected: {state.selected_count} | {state.status}"
+        f" Port: {port} | Last: {last} | Selected: {state.selected_count}{patch_segment} | {state.status}"
     )
     stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
     stdscr.addnstr(height - 1, 0, status.ljust(width), width - 1)
@@ -569,6 +615,11 @@ def _position_label(position: WritePosition) -> str:
 
 def _position_ordinal(position: WritePosition) -> int:
     return (position.bank_index * 20) + position.slot_index
+
+
+def _remaining_slots_from(position: WritePosition) -> int:
+    total_slots = len(BANKS) * 20
+    return total_slots - _position_ordinal(position)
 
 
 def _positions_inclusive(start: WritePosition, end: WritePosition) -> list[WritePosition]:
@@ -967,22 +1018,45 @@ def _send_files_with_progress(
     if not files:
         return False, "No .syx file selected", None
 
+    send_items: list[tuple[Path, ParsedSysEx]] = []
+    total_presets = 0
+    for file_path in files:
+        try:
+            raw = load_syx_file(file_path)
+            parsed_messages = parse_sysex_messages(raw)
+        except OSError as exc:
+            return False, f"File error: {exc}", None
+        except ValueError as exc:
+            return False, str(exc), None
+
+        for parsed in parsed_messages:
+            send_items.append((file_path, parsed))
+        total_presets += len(parsed_messages)
+
+    if total_presets == 0:
+        return False, "Invalid .syx file: no SysEx frame found", None
+
+    available = _remaining_slots_from(start_position)
+    if total_presets > available:
+        end_limit = WritePosition("T", 20)
+        return (
+            False,
+            (
+                "Not enough destination slots for selected data "
+                f"({total_presets} presets, {available} available from {_position_label(start_position)} "
+                f"to {_position_label(end_limit)})."
+            ),
+            None,
+        )
+
     current = start_position
     last_success: Optional[WritePosition] = None
     ack_count = 0
     last_ack_message: Optional[str] = None
 
-    total_files = len(files)
-    for index, file_path in enumerate(files, start=1):
-        try:
-            raw = load_syx_file(file_path)
-            parsed = parse_sysex_message(raw)
-            patched = patch_bank_slot_in_memory(parsed, current)
-            sysex_payload = to_mido_sysex_data(patched)
-        except OSError as exc:
-            return False, f"File error: {exc}", last_success
-        except ValueError as exc:
-            return False, str(exc), last_success
+    for index, (file_path, parsed) in enumerate(send_items, start=1):
+        patched = patch_bank_slot_in_memory(parsed, current)
+        sysex_payload = to_mido_sysex_data(patched)
 
         result = send_sysex(state.selected_port, sysex_payload)
         if not result.ok:
@@ -994,19 +1068,19 @@ def _send_files_with_progress(
 
         last_success = current
         if on_progress is not None:
-            on_progress(index, total_files, file_path, current)
+            on_progress(index, total_presets, file_path, current)
         current = increment_position(current)
 
-    if len(files) == 1 and last_success is not None:
+    if total_presets == 1 and last_success is not None:
         base = f"Sent {files[0].name} to {last_success.bank}{last_success.slot:02d}"
         if ack_count:
             return True, f"{base} | ACK received", last_success
         return True, f"{base} | No ACK", last_success
     if last_success is not None:
-        base = f"Sent {len(files)} files, last {last_success.bank}{last_success.slot:02d}"
+        base = f"Sent {total_presets} presets from {len(files)} file(s), last {last_success.bank}{last_success.slot:02d}"
         if ack_count:
-            ack_suffix = f" | ACK {ack_count}/{len(files)}"
-            if ack_count == len(files) and last_ack_message and "JN-80 reply" in last_ack_message:
+            ack_suffix = f" | ACK {ack_count}/{total_presets}"
+            if ack_count == total_presets and last_ack_message and "JN-80 reply" in last_ack_message:
                 ack_suffix += " (JN-80 confirmed)"
             return True, f"{base}{ack_suffix}", last_success
         return True, f"{base} | No ACK", last_success
@@ -1223,39 +1297,17 @@ def _handle_f6(stdscr: Optional[curses.window], state: AppState) -> None:
     if state.last_written is None:
         start = WritePosition("A", 1)
     else:
+        if state.last_written.bank == "T" and state.last_written.slot == 20:
+            message = "F6 stopped: last written is T20 (no next slot)"
+            state.status = message
+            _show_message_modal(stdscr, "Send Error", message)
+            return
         start = increment_position(state.last_written)
 
     _handle_send_with_progress_dialog(stdscr, state, start)
 
 
 def _handle_f2(stdscr: Optional[curses.window], state: AppState) -> None:
-    modal: Optional[curses.window] = None
-    modal_w = 0
-    modal_h = 0
-
-    def _render_init_progress(done: int, total: int, current: Optional[WritePosition]) -> None:
-        if modal is None:
-            return
-        inner_w = modal_w - 4
-        range_line = f"Range: {_position_label(from_position)} -> {_position_label(to_position)}"
-        current_line = f"Current: {_position_label(current)}" if current is not None else "Current: --"
-        lines = [
-            range_line,
-            f"Progress: {done}/{total}",
-            current_line,
-        ]
-        modal.erase()
-        modal.box()
-        modal.attron(curses.A_BOLD)
-        modal.addnstr(1, 2, _truncate_line("INIT Progress", inner_w), inner_w)
-        modal.attroff(curses.A_BOLD)
-        for idx, line in enumerate(lines, start=2):
-            if idx >= modal_h - 1:
-                break
-            modal.addnstr(idx, 2, _truncate_line(line, inner_w), inner_w)
-        modal.addnstr(modal_h - 2, 2, _truncate_line("Please wait...", inner_w), inner_w)
-        modal.refresh()
-
     selected = _prompt_init_range(
         stdscr,
         f"{state.last_init_from.bank}{state.last_init_from.slot}",
@@ -1274,34 +1326,99 @@ def _handle_f2(stdscr: Optional[curses.window], state: AppState) -> None:
         _show_message_modal(stdscr, "INIT Error", message)
         return
 
+    total_targets = len(_positions_inclusive(from_position, to_position))
     prompt = (
         "Are you sure you want to erase presets "
         f"from {_position_label(from_position)} to {_position_label(to_position)}?"
     )
-    if not _prompt_yes_no(stdscr, "Confirm INIT", prompt):
-        state.status = "INIT canceled"
+
+    # Headless/non-curses path keeps existing prompt helper behavior for tests.
+    if stdscr is None:
+        if not _prompt_yes_no(stdscr, "Confirm INIT", prompt):
+            state.status = "INIT canceled"
+            return
+
+        def _on_init_progress_headless(done: int, total: int, current: WritePosition) -> None:
+            state.status = f"INIT erasing {done}/{total}: {_position_label(current)}"
+
+        ok, message, _ = _send_init_range(
+            state,
+            from_position,
+            to_position,
+            on_progress=_on_init_progress_headless,
+        )
+        state.status = message
         return
 
-    total_targets = len(_positions_inclusive(from_position, to_position))
-    state.status = f"INIT erasing 0/{total_targets}..."
-    if stdscr is not None:
-        height, width = stdscr.getmaxyx()
-        modal_h = min(10, max(8, height - 2))
-        modal_w = min(72, max(52, width - 4))
-        y = (height - modal_h) // 2
-        x = (width - modal_w) // 2
-        modal = curses.newwin(modal_h, modal_w, y, x)
-        modal.keypad(True)
-        _render_init_progress(0, total_targets, None)
+    height, width = stdscr.getmaxyx()
+    modal_h = min(11, max(9, height - 2))
+    modal_w = min(76, max(54, width - 4))
+    y = (height - modal_h) // 2
+    x = (width - modal_w) // 2
+    modal = curses.newwin(modal_h, modal_w, y, x)
+    modal.keypad(True)
+
+    def _render_init_modal(title: str, lines: list[str], footer: str) -> None:
+        inner_w = modal_w - 4
+        modal.erase()
+        modal.box()
+        modal.attron(curses.A_BOLD)
+        modal.addnstr(1, 2, _truncate_line(title, inner_w), inner_w)
+        modal.attroff(curses.A_BOLD)
+        for idx, line in enumerate(lines, start=2):
+            if idx >= modal_h - 1:
+                break
+            modal.addnstr(idx, 2, _truncate_line(line, inner_w), inner_w)
+        modal.addnstr(modal_h - 2, 2, _truncate_line(footer, inner_w), inner_w)
+        modal.refresh()
+
+    _render_init_modal(
+        "Confirm INIT",
+        [
+            f"Range: {_position_label(from_position)} -> {_position_label(to_position)}",
+            f"Targets: {total_targets} preset(s)",
+            "",
+            prompt,
+        ],
+        "Enter/Y=Yes  Esc/N=No",
+    )
+
+    while True:
+        ch = modal.getch()
+        if ch in (10, 13, ord("y"), ord("Y")):
+            break
+        if ch in (27, ord("n"), ord("N")):
+            state.status = "INIT canceled"
+            return
+
+    def _render_init_progress(done: int, total: int, current: Optional[WritePosition]) -> None:
+        current_line = f"Current: {_position_label(current)}" if current is not None else "Current: --"
+        _render_init_modal(
+            "INIT Progress",
+            [
+                f"Range: {_position_label(from_position)} -> {_position_label(to_position)}",
+                f"Progress: {done}/{total}",
+                current_line,
+            ],
+            "Please wait...",
+        )
+
+    _render_init_progress(0, total_targets, None)
 
     def _on_init_progress(done: int, total: int, current: WritePosition) -> None:
         state.status = f"INIT erasing {done}/{total}: {_position_label(current)}"
         _render_init_progress(done, total, current)
 
-    ok, message, last = _send_init_range(state, from_position, to_position, on_progress=_on_init_progress)
+    ok, message, _ = _send_init_range(state, from_position, to_position, on_progress=_on_init_progress)
     state.status = message
 
-    _show_message_modal(stdscr, "INIT Result" if ok else "INIT Error", message)
+    _render_init_modal(
+        "INIT Result" if ok else "INIT Error",
+        [message],
+        "Press any key to close",
+    )
+    modal.timeout(-1)
+    modal.getch()
 
 
 def _handle_f8(stdscr: Optional[curses.window], state: AppState) -> None:
@@ -1546,6 +1663,12 @@ def _persist(state: AppState) -> None:
 
 
 def _app_loop(stdscr: curses.window, state: AppState) -> None:
+    # Reduce ncurses ESC sequence timeout so Esc-cancel in dialogs feels immediate.
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        pass
+
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.start_color()
@@ -1633,11 +1756,7 @@ def _app_loop(stdscr: curses.window, state: AppState) -> None:
             _show_help_modal(stdscr)
             state.status = "Help"
             continue
-        try:
-            key_name = curses.keyname(ch).decode("ascii", errors="ignore")
-        except Exception:
-            key_name = str(ch)
-        state.status = f"Key not mapped: {key_name} (press ? for help)"
+        continue
 
 
 def run() -> None:

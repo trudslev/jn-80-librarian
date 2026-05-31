@@ -44,29 +44,29 @@ Follow this workflow in order:
   - Bug fixes
   - Breaking changes (if any)
   - Dependencies added/updated
-  Pause for user to confirm changelog entry is clear and complete before proceeding.
+5. **Generate Release Title Proposal** - Propose a release title derived from the changelog highlights (concise, human-readable).
 
-5. **Git Commit** - Stage all changes:
+6. **Pause for Curation** - Pause and ask the user to confirm both:
+  - changelog content,
+  - proposed release title.
+  Do not commit/tag/push until user confirms.
+
+7. **Git Commit** - Stage all changes:
   ```
   git add .
   git commit -m "Release <VERSION>: <summary of changes>"
   ```
 
-6. **Tag Version** - Create annotated tag (must be plain semver with no leading 'v', e.g., `1.1.1`):
+8. **Tag Version** - Create annotated tag (must be plain semver with no leading 'v', e.g., `1.1.1`):
   ```
   git tag -a <VERSION> -m "Release <VERSION>"
   ```
 
-7. **Push** - Push commits and tags:
+9. **Push** - Push commits and tags:
   ```
   git push origin $(git rev-parse --abbrev-ref HEAD)
   git push origin --tags
   ```
-
-8. **Offer Smoke Test** - Ask user: "Push complete. Run a quick local smoke test now?" If yes, run:
-   ```
-   .venv/bin/python -m jn80_librarian
-   ```
 
 **Example:**
 - Last tag: `5.2.1`
