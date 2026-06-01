@@ -2,18 +2,23 @@
 
 Terminal SysEx librarian for Behringer JN-80 using a full-screen curses TUI.
 
+![JN-80 Librarian screenshot](images/jn-80-librarian.png)
+
 ## Features
 
-- Full-screen file browser showing folders and `.syx` files only
-- Multi-select with `Ctrl-T`
-- INIT erase range with `F2` (bank/preset to bank/preset)
-- Context-aware `F3`: `MERGE` for multi-selection, `SPLIT` for multi-preset files
-- MIDI output port selection with `F9` or `M`
-- Send with `F5` (choose bank/slot) or `F6` (next position)
-- Receive/download SysEx from synth with `F7` or `R`
-- Delete selected/highlighted `.syx` file(s) with `F8` (with confirmation)
-- In-memory rewrite of JN-80 DATA bank/slot bytes only
-- Session persistence for MIDI port, last written position, last F5 target, and last browsed dir
+- Browse folders and `.syx` files in a full-screen TUI
+- Copy/send `.syx` files to an explicit destination or the next sequential slot
+- Merge and split `.syx` files
+- Erase synth presets by bank/slot range
+- Receive presets from the synth for backup and organization
+- Delete `.syx` files from the current folder
+- Keep source files unchanged by rewriting JN-80 DATA bank/slot bytes in memory during send
+- Persist MIDI port, last written position, last F5 target, and last browsed directory
+
+## Prerequisites
+
+- Python 3 installed locally (`python3 --version`)
+- If Python 3 is not installed, download it from: https://www.python.org/downloads/
 
 ## Local setup (venv only)
 
@@ -47,42 +52,11 @@ python3 -m venv .venv
 - `F7` or `R`: Receive SysEx from synth and save as `.syx` in current folder
 - `F8`: Delete selected/highlighted `.syx` file(s) (with confirmation)
 - `?`: Show key help modal
-- `Q` or `F10`: Quit
+- `F10` or `Q`: Quit
 
-## Notes
+## AI Assistance
 
-- `.syx` files on disk are never modified.
-- During send, the destination write address and DATA bank/slot are rewritten in memory from the selected target.
-- F2 INIT sends an empty/blank JN-80 preset payload to each destination in the selected inclusive range.
-- During F2 INIT, one modal handles confirmation, live erase progress (`Progress: X/Y`, `Current: BNN`), and final result.
-- After each send, the app listens briefly for a SysEx reply and reports `ACK` or `No ACK`.
-- During F5/F6 send, the same dialog first shows live copy progress (`Progress: X/Y`, current file, target slot), then shows the final send result.
-- F5/F6 open a result dialog for clear send feedback; status is also mirrored in the bottom status bar.
-- When a `.syx` file is highlighted, the status bar shows its detected patch count (`Patches: N`).
-- F5/F6 send every SysEx frame found in each selected `.syx` file (not just the first frame).
-- Frames are sent in deterministic order: selected file order (selection timestamp), then frame order within each file.
-- Before F5/F6 send starts, destination capacity is validated from the selected start slot through `T20`; if there is not enough room for all frames, send is blocked before any write.
-- F6 does not wrap after `T20`; if `Last` is `T20`, `F6` stops with an error instead of writing to `A01`.
-- F5 remembers the last bank/slot you entered (independent from F6/INIT write history).
-- F2 INIT does not update `Last`; only successful file sends (F5/F6) advance write history.
-- F5 bank/slot entry is constrained to valid values only (bank `A-T`, slot `01-20`).
-- In F5 bank/slot entry, typing a valid bank letter auto-advances focus to the slot digits.
-- F3 label is context-aware: `MERGE` for multi-selection, `SPLIT` for highlighted multi-preset files, blank otherwise.
-- F3 MERGE preserves selection order and frame order while writing the merged output.
-- F3 SPLIT separate-file naming supports either patch-name filenames or `<bank><XX> - <patch name>` filenames.
-- F7/R opens a filename prompt, listens for incoming SysEx burst data, and saves captured dumps in the current directory.
-  - The same fixed-size dialog stays open for filename entry, waiting/progress, and final result stats.
-  - During waiting/receive, press any key to cancel the dump.
-  - On the JN-80: press SHIFT+INITIAL/WRITE, then select Dump Presets.
-  - Single patch: saves one file using the provided name.
-  - Multiple patches: combines all received SysEx frames into the same output file.
-  - Capture waits up to 45s total and ends after about 1.2s of no new SysEx frames.
-  - While capturing, the status bar shows live progress (`Receiving... patches: N`).
-- Receive result dialog shows details: selected port, received patch count, JN-80 frame count, saved file count, and saved filename range.
-- Errors are displayed in the send result dialog and the bottom status bar.
-- A dedicated F-key help strip is shown above the status bar for quick command reminders.
-- Directory rows are prefixed with `/`, and selected files are shown in yellow.
-- The top bar shows the running app version next to the title.
+This project was developed with AI assistance (GitHub Copilot). All code has been reviewed, tested, and understood by the maintainer. The AI was used as a tool, not as a substitute for engineering judgment.
 
 ## License
 
